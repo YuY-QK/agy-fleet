@@ -9,6 +9,7 @@
 | ---- | ---------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | v1.0 | 2026-11-09 | 自用版草案                                                                                                                        |
 | v1.2 | 2026-11-09 | M2 实现细化：租约只在“一轮运行期间”持有；全局并发上限触发时同样报 `account_busy`；`account_not_logged_in` 也暂停整个账号；`cancel_task` 的语义；任务归属进程与接手规则；model/effort 经 `session/set_config_option` 设置；`isolation` 推迟；M3 前的最小恢复方式 `AGY_FLEET_RESUME` |
+| v1.3 | 2026-11-10 | M3 决定：邮箱不自动读取，改为 `account add --email` 选填（§6.4）；`account remove` 默认只删账号库条目，`--purge` 才删 HOME；`AGY_FLEET_RESUME` 由 `account resume` 取代；命令白名单匹配与 `ask` 细则见 §6.5；配置优先级见 §6.8 |
 | v1.1 | 2026-11-09 | 改为通用、可公开安装的 MCP 服务器：任意 MCP 客户端可用；npm 分发；后台任务 + 查询；跨进程账号租约；随包附带编排指南；去掉个人信息 |
 
 ## 1. 一句话
@@ -36,7 +37,7 @@
 **第一版包含**
 
 - MCP 工具（§7）：账号、任务的派发/续聊/等待/列表/取消/关闭、模型列表。
-- 命令行：`agy-fleet mcp`（MCP 服务器入口）、`account add|list|login|remove`、`doctor`（环境自检）。
+- 命令行：`agy-fleet mcp`（MCP 服务器入口）、`account add|list|login|remove|resume`、`doctor`（环境自检）。
 - 账号隔离：每账号独立 HOME【已验证】。
 - 凭据存储按平台处理：macOS 为每账号建独立空钥匙串以消除弹窗【待验证安全性】；Linux 跳过【建议】。
 - 权限规则：worktree 内编辑放行、命令白名单、其余拒绝或交给用户确认（§6.5）【已定方向】。
@@ -113,10 +114,12 @@ skills/agy-fleet/SKILL.md  可选的 Claude Code 编排指南
 ### 6.4 账号与凭据
 
 - 目录：`~/.agy-fleet/accounts/<名称>/` 作为该账号的 HOME（位置可配置）。
-- `account add <名称>`：建 HOME → `credStore` 按平台准备 → 链接 `~/.gitconfig`（不链接 `~/.ssh`）→ 前台运行 `agy acp --login` 让用户在浏览器授权 → 读出邮箱写入元数据。
+- `account add <名称> [--email <邮箱>]`：建 HOME → `credStore` 按平台准备 → 链接 `~/.gitconfig`（不链接 `~/.ssh`）→ 前台运行 `agy acp --login` 让用户在浏览器授权 → 写入元数据。邮箱**不自动读取**（agy 没有本地命令给出邮箱，读取需要解析令牌，即触碰凭据），由使用者用 `--email` 选填，只作显示标签。
 - macOS 空钥匙串：在账号 HOME 内建空钥匙串并设为该 HOME 的默认钥匙串。**前提是证明不改动用户真实的登录钥匙串与搜索列表**；证明不了则退回“登录时弹一次窗，点取消”，并在文档中说明。
 - 元数据 `~/.agy-fleet/accounts.json`（名称、邮箱、状态、暂停原因）；凭据只在各账号 HOME 内，不记录到日志、不导出。
-- `doctor`：检查 agy 是否安装与版本、各账号登录状态、git 可用性、平台支持情况。
+- `account remove <名称>`：默认只删账号库条目、保留 HOME；`--purge` 才删除 HOME，须输入账号名二次确认，且只删除位于 agy-fleet 账号目录内的 HOME（手动登记的外部目录永不删除）；账号正在使用时拒绝。
+- macOS 建钥匙串前后比对用户真实钥匙串（`list-keychains`、`default-keychain`、`login-keychain` 与 `~/Library/Preferences/com.apple.security.plist`），有任何变化立即中止并报告，不做自动修复。
+- `doctor`：检查 agy 是否安装与版本、git 可用性、平台支持情况、各账号的 HOME/钥匙串/凭据是否存在与暂停状态。默认只做静态检查（钥匙串里是否有 agy 的条目或回退令牌文件，不读出秘密；只能说明“凭据存在”，不代表令牌有效），`--online` 才对每个账号真实运行一次 `agy models`。
 
 ### 6.5 权限
 
@@ -132,6 +135,14 @@ skills/agy-fleet/SKILL.md  可选的 Claude Code 编排指南
 - 权限请求所带字段（路径、命令原文）以 M0 实测为准；信息不足以判断的类别一律走 `outside_policy`。
 - 会话模式用 agy 的默认（逐项询问）模式，不使用 `--dangerously-skip-permissions`。
 
+M3 细则【已定】：
+
+- 命令白名单默认为空。条目按“词”比较：普通条目要求命令与条目完全相同；条目末尾写 ` *` 表示允许在其后追加任意参数（如 `git diff *`）。支持简单的单引号、双引号。
+- 命令里只要出现 shell 控制或展开（`;`、`&`、`|`、`<`、`>`、`` ` ``、`$`、`(`、`)`、`{`、`}`、换行、未闭合引号等）或以 `变量=值` 开头，就**一律不算命中**，按 `outside_policy` 处理，防止 `a && b`、管道、子 shell、重定向等绕过。
+- 按仓库的白名单只来自配置文件 `repos.<仓库绝对路径>`，**绝不读取仓库里的文件**（工作进程能改 worktree，读仓库文件等于让它给自己提权）。
+- 风险提示：白名单里任何会执行仓库代码的命令（测试、构建、`npm run` 等）都等于允许工作进程执行任意代码（它可以先改测试或脚本），README 与配置示例须显著说明。
+- `ask` 适用于越界编辑、非白名单命令和其他类别；但 `.git` 内的路径、无法解析的路径、请求里没有路径时直接拒绝，不弹窗。弹窗 5 分钟无回应、用户拒绝、客户端不支持 elicitation，都按拒绝处理并记入 `denied`；用户批准的操作记入任务日志与结果的 `approved` 列表。
+
 ### 6.6 给工作进程的固定指令
 
 通过 ACP 会话的系统提示追加：只在当前目录工作；不 commit、不 push；结束时按固定格式汇报（做了什么、改了哪些文件、如何验证、遗留问题）。
@@ -140,14 +151,14 @@ skills/agy-fleet/SKILL.md  可选的 Claude Code 编排指南
 
 - 错误码（明确枚举）：`agy_not_found`、`account_not_logged_in`、`account_busy`、`account_paused`、`quota_exhausted`、`auth_expired`、`timeout`、`agent_crashed`、`worktree_failed`、`invalid_input`、`cancelled`。
 - 全局并发上限触发时也返回 `account_busy`（消息里注明是全局上限）；`account_not_logged_in`（握手阶段认证失败）与 `auth_expired` 一样暂停整个账号。
-- `quota_exhausted` → 暂停该**账号 + 模型**组合（额度可能按模型分别计算，见验证结论 §2.3）；`auth_expired` → 暂停整个账号。都带原因和时间，`account login` 或 `account resume` 解除（M3）。M2 的最小恢复方式：启动时设环境变量 `AGY_FLEET_RESUME=<账号名,…>`（`*` 为全部），或手动清除 `accounts.json` 里的 `paused`/`pausedModels`。未指定模型的任务，暂停记在键 `(default)` 上。
+- `quota_exhausted` → 暂停该**账号 + 模型**组合（额度可能按模型分别计算，见验证结论 §2.3）；`auth_expired` → 暂停整个账号。都带原因和时间。`account resume <名称> [--model <模型>]` 解除（不给模型则全部解除）；`account login` 成功后只解除整个账号的暂停，保留按模型的额度暂停（M3 起取代 M2 临时的 `AGY_FLEET_RESUME`）。未指定模型的任务，暂停记在键 `(default)` 上。
 - 分类只对笼统的 `agent_crashed` 按文本重判（`RESOURCE_EXHAUSTED`/429/quota 等 → `quota_exhausted`；`UNAUTHENTICATED`/401/token expired 等 → `auth_expired`），超时、取消等明确错误码不被改写。
 - 原始错误文本完整写入任务日志，以便校正分类规则。
 - 令牌约 1 小时过期，依赖 agy 自动刷新【待验证】。
 
 ### 6.8 配置
 
-M2 阶段配置来自环境变量（`AGY_FLEET_DATA_DIR`、`AGY_FLEET_ACCOUNTS_FILE`、`AGY_FLEET_WORKTREE_ROOT`、`AGY_FLEET_TURN_TIMEOUT_MINUTES`、`AGY_FLEET_IDLE_TIMEOUT_MINUTES`、`AGY_FLEET_PER_ACCOUNT_CONCURRENCY`、`AGY_FLEET_GLOBAL_CONCURRENCY`、`AGY_FLEET_RESUME`，开发测试另有 `AGY_FLEET_ACCOUNT_HOME`），`config.yaml` 留给 M3。目标形态：`~/.agy-fleet/config.yaml`（全部可选）：账号目录、worktree 根目录（默认 `~/.agy-fleet/worktrees/`）、每账号并发、全局并发、空闲超时、单轮超时、默认模型与推理强度、命令白名单（全局/按仓库）、`outside_policy`。
+M2 阶段配置来自环境变量（`AGY_FLEET_DATA_DIR`、`AGY_FLEET_ACCOUNTS_FILE`、`AGY_FLEET_WORKTREE_ROOT`、`AGY_FLEET_TURN_TIMEOUT_MINUTES`、`AGY_FLEET_IDLE_TIMEOUT_MINUTES`、`AGY_FLEET_PER_ACCOUNT_CONCURRENCY`、`AGY_FLEET_GLOBAL_CONCURRENCY`、`AGY_FLEET_RESUME`，开发测试另有 `AGY_FLEET_ACCOUNT_HOME`），M3 起增加配置文件 `<数据目录>/config.yaml`（`AGY_FLEET_CONFIG` 可指定其他位置），优先级：环境变量 > 配置文件 > 默认值；文件格式或字段写错时启动失败并指出字段，不静默忽略；只在进程启动时读取。内容：`~/.agy-fleet/config.yaml`（全部可选）：账号目录、worktree 根目录（默认 `~/.agy-fleet/worktrees/`）、每账号并发、全局并发、空闲超时、单轮超时、默认模型与推理强度、命令白名单（全局/按仓库）、`outside_policy`。
 
 ### 6.9 隐私
 
