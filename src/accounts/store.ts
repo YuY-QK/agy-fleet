@@ -5,7 +5,7 @@ import { FleetError } from '../errors.ts';
 import { withFileLock, writeFileAtomic } from '../fsutil.ts';
 
 // 账号库：`accounts.json`。多个 agy-fleet 进程共享，所以每次读都重新读文件，
-// 每次改都在文件锁里“读-改-原子写”。账号本身（HOME、登录）由使用者准备，M3 才有 `account` 命令。
+// 每次改都在文件锁里“读-改-原子写”。账号的 HOME 与登录由 `agy-fleet account …` 命令准备（accounts/setup.ts）。
 
 const PauseInfoSchema = z.object({
     /** 触发暂停的错误码。 */
@@ -56,6 +56,36 @@ export class AccountStore {
         });
     }
 
+    /** 新增账号；同名已存在则报错。 */
+    add(account: AccountRecord): void {
+        this.#update((accounts) => {
+            if (accounts.some((a) => a.name === account.name)) {
+                throw new FleetError('invalid_input', `账号库里已有同名账号：${account.name}`);
+            }
+            accounts.push({ ...account });
+        });
+    }
+
+    /** 从账号库删除账号条目（不动它的 HOME）。 */
+    remove(name: string): void {
+        const state = { found: false };
+        this.#update((accounts) => {
+            const index = accounts.findIndex((a) => a.name === name);
+            if (index >= 0) {
+                state.found = true;
+                accounts.splice(index, 1);
+            }
+        });
+        if (!state.found) throw new FleetError('invalid_input', `账号库里没有账号：${name}`);
+    }
+
+    /** 只解除整个账号的暂停（登录成功后用），保留按模型的额度暂停。 */
+    resumeAccountOnly(name: string): void {
+        this.#mutate(name, (account) => {
+            delete account.paused;
+        });
+    }
+
     /** 该账号用 `model` 跑任务是否被暂停；返回暂停信息，没有暂停返回 undefined。 */
     pauseFor(name: string, model: string | undefined): PauseInfo | undefined {
         const account = this.get(name);
@@ -77,7 +107,7 @@ export class AccountStore {
 
     /**
      * 解除暂停。不给 `model` 时清掉整个账号的暂停和所有模型暂停；给了只清该模型。
-     * 正式的 `account resume` 命令在 M3，这里是内部函数与环境变量 `AGY_FLEET_RESUME` 的实现。
+     * `agy-fleet account resume` 命令的实现。
      */
     resume(name: string, model?: string): void {
         this.#mutate(name, (account) => {
