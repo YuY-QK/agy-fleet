@@ -1,6 +1,6 @@
 # agy-fleet 方案 v1.1（通用版，精简规划）
 
-> 状态：**草案，待确认**。验证依据见 [acp-验证结论.md](acp-验证结论.md)。
+> 状态：**已确认**（v1.2 补充了 M2 实现中的细化，见变更记录）。验证依据见 [acp-验证结论.md](acp-验证结论.md)。
 > 标注：【已验证】实测过；【已定】已确认；【建议】待确认；【待验证】M0 实测。
 
 ## 0. 变更记录
@@ -8,6 +8,7 @@
 | 版本 | 日期       | 变更                                                                                                                              |
 | ---- | ---------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | v1.0 | 2026-11-09 | 自用版草案                                                                                                                        |
+| v1.2 | 2026-11-09 | M2 实现细化：租约只在“一轮运行期间”持有；全局并发上限触发时同样报 `account_busy`；`account_not_logged_in` 也暂停整个账号；`cancel_task` 的语义；任务归属进程与接手规则；model/effort 经 `session/set_config_option` 设置；`isolation` 推迟；M3 前的最小恢复方式 `AGY_FLEET_RESUME` |
 | v1.1 | 2026-11-09 | 改为通用、可公开安装的 MCP 服务器：任意 MCP 客户端可用；npm 分发；后台任务 + 查询；跨进程账号租约；随包附带编排指南；去掉个人信息 |
 
 ## 1. 一句话
@@ -68,7 +69,7 @@
   └─ 不合格 → send_message(task_id, 修改意见) → 回到执行
 ```
 
-任务状态：`running → idle(等待审查) → running …→ closed`；失败为 `failed`（带错误码）。
+任务状态：`running → idle(等待审查) → running …→ closed`；失败为 `failed`（带错误码）。`cancel_task` 取消当前一轮后任务为 `failed(cancelled)`，worktree 与会话保留，仍可 `send_message` 继续或 `close_task` 清理。`failed` 的任务只要已有会话，同样可以 `send_message` 用 `session/load` 恢复。
 
 ## 6. 技术方案
 
@@ -103,7 +104,9 @@ skills/agy-fleet/SKILL.md  可选的 Claude Code 编排指南
 ### 6.3 进程模型与多客户端
 
 - 每个 MCP 客户端会话启动一个 `agy-fleet mcp` 进程（stdio）。多个客户端同时运行时，通过 **`~/.agy-fleet/leases/` 下的账号租约文件**协调：同一账号同一时刻只被一个任务占用（并发上限可配置），进程退出或心跳超时后租约自动回收。用租约而不用常驻守护进程，是为了保持“装上即用”，常驻进程放第二版。
-- 每个任务一个 `agy acp` 子进程，`HOME=<账号HOME>`，`cwd=<worktree>`。一轮结束后保留子进程等待续聊，空闲超时（默认 30 分钟）后关闭；之后的 `send_message` 用 `session/load` 恢复【待验证】。
+- **租约只在“一轮运行期间”持有**（含子进程启动与握手）：一轮结束进入 `idle` 就释放，等待审查时账号可被别的任务使用；`send_message` 时重新占用，账号正忙则返回 `account_busy`（任务仍是 `idle`）。每账号并发默认 1（账号库条目的 `maxConcurrency` 可覆盖），全局默认 4。租约失效条件：持有进程已不存在，或心跳（5s）超过 30s 未刷新。
+- **任务归属**：任务记录里有 `ownerPid`。属主进程仍在运行时，其他 `agy-fleet` 进程只能查看（`list_tasks`/`wait_task`），`send_message`/`cancel_task`/`close_task` 返回 `invalid_input`；属主已退出则可接手（`running` 的任务先被标为 `failed(agent_crashed)`，会话仍可恢复）。
+- 每个任务一个 `agy acp` 子进程，`HOME=<账号HOME>`，`cwd=<worktree>`。一轮结束后保留子进程等待续聊，空闲超时（默认 30 分钟）后关闭；之后的 `send_message` 用 `session/load` 恢复【已验证：M0 与 M2 真实账号】。恢复时 agent 会重放历史，客户端丢弃这些通知。空闲期间子进程自己退出的，同样按此路径恢复。
 - 已知限制：MCP 服务器随客户端会话结束而退出，进行中的任务随之终止；任务记录与结果持久化在 `~/.agy-fleet/tasks/`，之后仍可查看。
 - 长任务与客户端超时：工具默认支持 `background: true`，立即返回，再用 `wait_task` 取结果（单次等待有上限，超时返回“仍在运行”而不是报错）。
 
@@ -136,13 +139,15 @@ skills/agy-fleet/SKILL.md  可选的 Claude Code 编排指南
 ### 6.7 错误与账号状态
 
 - 错误码（明确枚举）：`agy_not_found`、`account_not_logged_in`、`account_busy`、`account_paused`、`quota_exhausted`、`auth_expired`、`timeout`、`agent_crashed`、`worktree_failed`、`invalid_input`、`cancelled`。
-- `quota_exhausted` → 暂停该**账号 + 模型**组合（额度可能按模型分别计算，见验证结论 §2.3）；`auth_expired` → 暂停整个账号。都带原因和时间，`account login` 或 `account resume` 解除。
+- 全局并发上限触发时也返回 `account_busy`（消息里注明是全局上限）；`account_not_logged_in`（握手阶段认证失败）与 `auth_expired` 一样暂停整个账号。
+- `quota_exhausted` → 暂停该**账号 + 模型**组合（额度可能按模型分别计算，见验证结论 §2.3）；`auth_expired` → 暂停整个账号。都带原因和时间，`account login` 或 `account resume` 解除（M3）。M2 的最小恢复方式：启动时设环境变量 `AGY_FLEET_RESUME=<账号名,…>`（`*` 为全部），或手动清除 `accounts.json` 里的 `paused`/`pausedModels`。未指定模型的任务，暂停记在键 `(default)` 上。
+- 分类只对笼统的 `agent_crashed` 按文本重判（`RESOURCE_EXHAUSTED`/429/quota 等 → `quota_exhausted`；`UNAUTHENTICATED`/401/token expired 等 → `auth_expired`），超时、取消等明确错误码不被改写。
 - 原始错误文本完整写入任务日志，以便校正分类规则。
 - 令牌约 1 小时过期，依赖 agy 自动刷新【待验证】。
 
 ### 6.8 配置
 
-`~/.agy-fleet/config.yaml`（全部可选）：账号目录、worktree 根目录（默认 `~/.agy-fleet/worktrees/`）、每账号并发、全局并发、空闲超时、单轮超时、默认模型与推理强度、命令白名单（全局/按仓库）、`outside_policy`。
+M2 阶段配置来自环境变量（`AGY_FLEET_DATA_DIR`、`AGY_FLEET_ACCOUNTS_FILE`、`AGY_FLEET_WORKTREE_ROOT`、`AGY_FLEET_TURN_TIMEOUT_MINUTES`、`AGY_FLEET_IDLE_TIMEOUT_MINUTES`、`AGY_FLEET_PER_ACCOUNT_CONCURRENCY`、`AGY_FLEET_GLOBAL_CONCURRENCY`、`AGY_FLEET_RESUME`，开发测试另有 `AGY_FLEET_ACCOUNT_HOME`），`config.yaml` 留给 M3。目标形态：`~/.agy-fleet/config.yaml`（全部可选）：账号目录、worktree 根目录（默认 `~/.agy-fleet/worktrees/`）、每账号并发、全局并发、空闲超时、单轮超时、默认模型与推理强度、命令白名单（全局/按仓库）、`outside_policy`。
 
 ### 6.9 隐私
 
@@ -155,12 +160,14 @@ skills/agy-fleet/SKILL.md  可选的 Claude Code 编排指南
 | --------------- | --------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
 | `list_accounts` | —                                                                                                                                       | 名称、邮箱、状态（idle/busy/paused+原因）、当前任务                                                                      |
 | `list_models`   | `account?`                                                                                                                              | 可用模型与推理强度                                                                                                       |
-| `run_task`      | `prompt`、`repo`、`description`、`account?`、`isolation?`（`worktree` 默认 / `none` 只读）、`base?`、`model?`、`effort?`、`background?` | 前台：`task_id`、账号、worktree、分支、结束原因、最终汇报、diff 统计、`denied`、日志路径；后台：`task_id` 与上述位置信息 |
+| `run_task`      | `prompt`、`repo`、`description`、`account?`、`isolation?`（`worktree` 默认 / `none` 只读；**M2 未实现**，当前总是 worktree）、`base?`、`model?`、`effort?`（经 ACP `session/set_config_option` 的 `model` / `thought_level` 设置，无效值得 `invalid_input`）、`background?` | 前台：`task_id`、账号、worktree、分支、结束原因、最终汇报、diff 统计、`denied`、日志路径；后台：`task_id` 与上述位置信息 |
 | `send_message`  | `task_id`、`message`、`background?`                                                                                                     | 同 `run_task`                                                                                                            |
 | `wait_task`     | `task_id`、`timeout_s?`                                                                                                                 | 结果，或“仍在运行”                                                                                                       |
 | `list_tasks`    | `status?`                                                                                                                               | 任务列表：状态、账号、已运行时长、最近动作                                                                               |
-| `cancel_task`   | `task_id`                                                                                                                               | 已取消                                                                                                                   |
-| `close_task`    | `task_id`、`delete_branch?`                                                                                                             | 关闭会话并删除 worktree                                                                                                  |
+| `cancel_task`   | `task_id`                                                                                                                               | 取消当前一轮，任务变 `failed(cancelled)`，worktree 与会话保留                                                            |
+| `close_task`    | `task_id`、`delete_branch?`                                                                                                             | 关闭会话并删除 worktree；分支默认保留，`delete_branch=true` 才删                                                         |
+
+`wait_task` 的 `timeout_s` 默认 45、上限 300 秒；返回里带 `still_running`。`list_models` 用 `agy models` 取模型，推理强度档位（low/medium/high）随模型变化，由 agy 在设置时校验。
 
 **Prompt**：`orchestrate` —— 编排指南：如何拆分不重叠任务、写自包含的任务说明、何时用后台、如何审查 diff、如何写返工意见、何时自己动手。
 

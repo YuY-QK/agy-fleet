@@ -26,21 +26,30 @@
 - 新增测试：`acp/process.test.ts`（孙进程回收、忽略 SIGTERM 强杀、组长退出后清扫、命令不存在）、`acp/worker.test.ts`（用 `mock-agent.fixture.mjs` 模拟 agent：握手+权限应答、认证失败、握手超时、崩溃、单轮超时、取消）。
 - 验证：`pnpm typecheck`、`lint`、`fmt:check`、`test`（30 项）、`build` 通过；MCP 客户端经 stdio 调新构建产物（acct1）：新建文件 `end_turn`、diff `hello.txt +1/-0`；执行命令被拒，`denied` 含 `execute / run_command / echo hi > from_cmd.txt`；无残留 agy 进程。
 
-### 未验证
+- **M2 多账号与续聊：已完成**（本地提交，**尚未推送**；端到端第①项待 acct2 就绪，见下）。
+  - 新增：`accounts/{store,lease,models}`、`tasks/{store,manager}`、`errors.ts`（错误码全集、分类、暂停粒度）、`fsutil.ts`（文件锁/原子写/pid 检查）；`acp/worker` 增加 `session/load` 恢复与 `model`/`effort`（`session/set_config_option`）；`mcp/server` 提供 PLAN §7 全部 8 个工具；`tasks/run.ts` 由 `manager.ts` 取代。细化决定见 PLAN 变更记录 v1.2。
+  - 默认值（待你确认，可用环境变量改）：每账号并发 1、全局并发 4、空闲超时 30 分钟、单轮超时 30 分钟、租约心跳 5s/过期 30s、`wait_task` 默认 45s/上限 300s。
+  - 验证（2026-11-09）：`pnpm typecheck`、`lint`、`fmt:check`、`test`（97 项）、`build` 通过。新增测试覆盖：租约（同进程上限、全局上限、心跳过期、**6 个真实子进程同时抢占只有 1 个成功**、**SIGKILL 持有者后回收**、心跳续命）、账号库与暂停粒度、错误分类、状态机非法转移、后台 `wait_task` 超时/取消/关闭、空闲超时后 `session/load` 续聊、重启后查看与接手、跨进程只读、模拟额度/认证错误的暂停与恢复、MCP 工具端到端（内存传输）。
+  - 真实账号 acct1 端到端（MCP 客户端 → `dist/cli.js`）：②后台派发 + `wait_task` + `send_message` 返工，`hello.txt` 由 `hello` 改为 `hello world`；③两个 `agy-fleet mcp` 进程争用同一账号，后者得到 `account_busy`，`list_accounts` 在另一进程里显示 busy 与任务号，跨进程 `send_message` 被拒（只读）；④`cancel_task` 后租约释放、无 agy 进程、worktree 保留，`close_task(delete_branch)` 删除 worktree 与分支；⑤SIGKILL 持有租约的 MCP 进程后，租约文件仍在但被下一个进程回收，同账号新任务成功，并用 `send_message` 接手被杀进程的任务（真实 `session/load`，之前的与新的修改都在 diff 里）；另验证空闲超时（0.05 分钟）后子进程退出，`send_message` 经 `session/load` 仍记得上一轮任务。全程无残留 agy 进程与租约。
+  - 自查（租约/并发/僵尸进程）：检查并修复了“空闲期间子进程自己退出后 `send_message` 会卡到单轮超时”（现立即识别并在新进程 load 恢复，有测试）；租约“检查人数+创建文件”在同一把文件锁里；陈旧锁回收有极小的竞态窗口（见未验证）。
 
-- Codex 等其他客户端未测（由开发者自行测试）。
-- `tasks/run.ts` 的完整流程仅靠真实账号验收（`worker` 握手/权限/超时/取消已有模拟 agent 测试）。
-- 未测：超时与客户端取消路径、agy 未登录/不存在时的错误码、钥匙串锁定时的解锁。
-- `usage` 目前为空：agy 未发 `usage_update`，是否有用量字段待查。
+### 未验证 / 已知限制
+
+- **①两账号并行**尚未做：acct2 是你的主账号，需先建独立空钥匙串并由你亲自重新登录（步骤见 [acp-验证结论.md](acp-验证结论.md) §2.2 与 §3），或提供第三个账号目录。两账号并行的逻辑已由模拟 agent 测试和“同账号争用”真实测试覆盖。
+- 额度用尽无法真实触发：分类靠 `RESOURCE_EXHAUSTED`/429 文本匹配，只用模拟 agent 测过；真实文本待校正（原始错误已完整写入任务日志）。
+- 文件锁的陈旧回收有极小竞态窗口（两个进程同时判定同一把陈旧锁）；租约临界区只有几次小文件读写，且以进程存活为主要判据，风险接受。
+- SIGKILL 主进程后，空闲的 agy 子进程依赖 agy 自己在 stdin 关闭后退出（一次实测有约数秒的残留，随后消失）；正常退出与信号退出由 `shutdown` 回收。
+- `isolation: none`（只读任务）未实现；`usage` 仍为空；Codex 等其他客户端未测；`tasks` 记录与日志的 14 天清理未做（M3/M4）。
+- 权限规则（`policy/permissions.ts`）本阶段未改动，M1 的测试与行为不变；命令类仍一律拒绝（所以要求 agent 执行 `pwd && ls` 之类会被拒并记入 `denied`）。
 
 ## 计划
 
-- M2 多账号与续聊：账号库与租约、后台/等待、`send_message`、`list_*`、`cancel/close`、错误分类与暂停。
+- ~~M2 多账号与续聊~~（已完成，余①两账号并行真实验证）。
 - M3 账号命令与权限：`account`/`doctor`、平台凭据处理、权限规则 + elicitation。
 - M4 发布：编排 prompt 与 skill、README（英/中）、npm 发布。
 详见 [PLAN_v1.1.md](PLAN_v1.1.md) §9。
 
 ## 待办
 
-- 已定：工作进程默认模型沿用 agy 默认（不指定）；按任务指定 `model` 留到 M2 接入。
+- 已定：工作进程默认模型沿用 agy 默认（不指定）；`model`/`effort` 可按任务指定（M2 已接入）。
 - 已定：产品不内置任何账号；开发测试临时用开发者本机账号，不进仓库。
