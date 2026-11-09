@@ -5,7 +5,7 @@
 ## 现状
 
 - **M0 验证完成**：七项结论见 [acp-验证结论.md](acp-验证结论.md)；方案 [PLAN_v1.1.md](PLAN_v1.1.md) 已确认。GitHub 仓库 `YuY-QK/agy-fleet`，npm 包名 `agy-fleet` 可用。
-- **M1 单账号跑通：已实现，等待确认**。
+- **M1 单账号跑通：已完成**（已推送到 `YuY-QK/agy-fleet`，GitHub Actions CI 全部步骤通过）。
   - 骨架：TypeScript（Node `^22.13 || >=24`）、ESM、pnpm、tsdown、vitest、eslint + prettier、GitHub Actions CI（类型检查、lint、格式、测试、构建）。依赖锁定：`@agentclientprotocol/sdk` 2.0.2（满两周的最新版；2.1.0 起不足两周，2.0.2 与 `agy acp` 的 protocolVersion 1 实测兼容）、`@modelcontextprotocol/sdk` 1.32.2、`zod` 4.6.7。
   - 模块：`acp/{process,worker,collector}`、`git/worktree`、`policy/permissions`、`accounts/credStore`（仅 macOS 钥匙串解锁）、`tasks/run`、`mcp/server`（仅前台 `run_task`）、`log`、`config`（环境变量）。
   - 账号：`AGY_FLEET_ACCOUNT_HOME` 指向账号 HOME（开发测试时指向本机的测试账号）。
@@ -32,7 +32,6 @@
 - `tasks/run.ts` 的完整流程仅靠真实账号验收（`worker` 握手/权限/超时/取消已有模拟 agent 测试）。
 - 未测：超时与客户端取消路径、agy 未登录/不存在时的错误码、钥匙串锁定时的解锁。
 - `usage` 目前为空：agy 未发 `usage_update`，是否有用量字段待查。
-- 未推送；`.github/workflows/ci.yml` 尚未在 GitHub 上跑过。
 
 ## 计划
 
