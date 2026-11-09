@@ -1,0 +1,5 @@
+packages:
+    - .
+
+# 只安装发布满两周的版本。
+minimumReleaseAge: 20160

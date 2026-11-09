@@ -1,0 +1,40 @@
+{
+    "name": "agy-fleet",
+    "version": "0.1.0",
+    "private": true,
+    "description": "MCP 服务器：把编码任务分派给本机多个账号下的 Antigravity CLI（agy），通过 ACP 驱动",
+    "license": "MIT",
+    "type": "module",
+    "bin": {
+        "agy-fleet": "dist/cli.js"
+    },
+    "files": [
+        "dist",
+        "LICENSE"
+    ],
+    "engines": {
+        "node": "^22.13 || >=24"
+    },
+    "scripts": {
+        "build": "tsdown",
+        "typecheck": "tsc --noEmit",
+        "lint": "eslint .",
+        "fmt": "prettier --write . --log-level error",
+        "fmt:check": "prettier --check .",
+        "test": "vitest --run"
+    },
+    "devDependencies": {
+        "@agentclientprotocol/sdk": "2.0.2",
+        "@eslint/js": "^10.0.1",
+        "@modelcontextprotocol/sdk": "1.32.2",
+        "@types/node": "^22.20.5",
+        "eslint": "^10.13.0",
+        "prettier": "^3.9.10",
+        "tsdown": "^0.23.2",
+        "typescript": "^6.0.3",
+        "typescript-eslint": "^8.72.0",
+        "vitest": "^5.0.5",
+        "zod": "4.6.7"
+    },
+    "packageManager": "pnpm@11.22.0"
+}
