@@ -85,7 +85,7 @@ async function runPrompt(id) {
         title: '运行命令',
         kind: 'execute',
         name: 'run_command',
-        rawInput: { CommandLine: 'echo hi' },
+        rawInput: { CommandLine: process.env.MOCK_COMMAND ?? 'echo hi' },
     });
     const chosen = [edit, exec].map((r) => r.outcome.optionId ?? r.outcome.outcome).join(',');
     send({

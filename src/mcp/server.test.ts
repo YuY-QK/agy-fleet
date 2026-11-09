@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { loadConfig } from '../config.ts';
 import { TaskManager } from '../tasks/manager.ts';
@@ -101,5 +102,87 @@ describe('MCP 工具', () => {
         expect(failed.body.task_id).toBeDefined();
         const missing = await call('wait_task', { task_id: 'tnope' });
         expect(missing).toMatchObject({ isError: true, body: { code: 'invalid_input' } });
+    });
+});
+
+describe('规则外操作经 elicitation 询问用户', () => {
+    async function connect(
+        capabilities: Record<string, unknown>,
+        answer?: (message: string) => { action: string; content?: Record<string, unknown> } | Promise<never>,
+    ): Promise<{ client: Client; messages: string[] }> {
+        await manager.shutdown();
+        const config = loadConfig({ AGY_FLEET_DATA_DIR: path.join(root, 'data2') });
+        manager = new TaskManager({
+            ...config,
+            agyBin: process.execPath,
+            agyArgs: [mockAgent],
+            envAccountHome: path.join(root, 'home'),
+            permissions: { ...config.permissions, outsidePolicy: 'ask' },
+        });
+        manager.init();
+        const server = createServer(manager, { askTimeoutMs: 300 });
+        const [a, b] = InMemoryTransport.createLinkedPair();
+        const asking = new Client({ name: 'test', version: '0' }, { capabilities });
+        const messages: string[] = [];
+        if (answer !== undefined) {
+            asking.setRequestHandler(ElicitRequestSchema, (request) => {
+                messages.push(request.params.message);
+                return answer(request.params.message);
+            });
+        }
+        await Promise.all([server.connect(a), asking.connect(b)]);
+        return { client: asking, messages };
+    }
+
+    async function runOutside(c: Client): Promise<any> {
+        process.env.MOCK_MODE = 'ok';
+        process.env.MOCK_EDIT_PATH = path.join(root, 'outside.txt');
+        try {
+            const result = await c.callTool({
+                name: 'run_task',
+                arguments: { prompt: 'x', repo: path.join(root, 'repo') },
+            });
+            return JSON.parse((result.content as { text: string }[])[0]?.text ?? 'null');
+        } finally {
+            Reflect.deleteProperty(process.env, 'MOCK_EDIT_PATH');
+        }
+    }
+
+    it('用户选择允许：编辑放行进 approved；命令被拒进 denied；弹窗里写明操作与原文', async () => {
+        const { client: c, messages } = await connect({ elicitation: { form: {} } }, (message) =>
+            message.includes('修改文件')
+                ? { action: 'accept', content: { decision: 'allow' } }
+                : { action: 'accept', content: { decision: 'deny' } },
+        );
+        const body = await runOutside(c);
+        expect(body.final_report).toContain('选择:allow,deny');
+        expect(body.approved).toHaveLength(1);
+        expect(body.denied).toMatchObject([{ kind: 'execute', target: 'echo hi' }]);
+        expect(messages).toHaveLength(2);
+        expect(messages[0]).toContain(path.join(root, 'outside.txt'));
+        expect(messages[1]).toContain('echo hi');
+    });
+
+    it('只声明 elicitation: {} 的旧客户端也能询问；decline / cancel 按拒绝', async () => {
+        const { client: c } = await connect({ elicitation: {} }, (message) =>
+            message.includes('修改文件') ? { action: 'decline' } : { action: 'cancel' },
+        );
+        const body = await runOutside(c);
+        expect(body.final_report).toContain('选择:deny,deny');
+        expect(body.denied).toHaveLength(2);
+    });
+
+    it('客户端不支持 elicitation：不发请求，按拒绝并写明原因', async () => {
+        const { client: c } = await connect({});
+        const body = await runOutside(c);
+        expect(body.final_report).toContain('选择:deny,deny');
+        expect(body.denied[0].reason).toContain('不支持');
+    });
+
+    it('用户迟迟不回应：超时按拒绝', async () => {
+        const { client: c } = await connect({ elicitation: { form: {} } }, () => new Promise<never>(() => undefined));
+        const body = await runOutside(c);
+        expect(body.final_report).toContain('选择:deny,deny');
+        expect(body.denied[0].reason).toContain('超时');
     });
 });

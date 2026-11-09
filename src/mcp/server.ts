@@ -1,9 +1,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { ElicitResultSchema, ErrorCode, McpError, type CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
 import { FleetError } from '../errors.ts';
 import { log } from '../log.ts';
-import type { TaskManager } from '../tasks/manager.ts';
+import type { AskAnswer, PermissionAsker, TaskManager } from '../tasks/manager.ts';
 
 const STATUS = z.enum(['running', 'idle', 'failed', 'closed']);
 
@@ -25,9 +25,76 @@ function fail(tool: string, err: unknown): CallToolResult {
     return { isError: true, content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
 }
 
-/** 创建 MCP 服务器，工具全部委托给 TaskManager。 */
-export function createServer(manager: TaskManager): McpServer {
-    const server = new McpServer({ name: 'agy-fleet', version: '0.2.0' });
+/** MCP 请求超时的错误码（SDK 把它定义成枚举，McpError.code 是普通数字）。 */
+const REQUEST_TIMEOUT: number = ErrorCode.RequestTimeout;
+
+const KIND_TEXT: Record<string, string> = {
+    edit: '修改文件',
+    delete: '删除文件',
+    move: '移动文件',
+    execute: '执行命令',
+};
+
+/** 弹窗里的文本来自工作进程，过长时截断，避免把提示语挤出视野。 */
+function clip(text: string, max = 1500): string {
+    return text.length <= max
+        ? text
+        : `${text.slice(0, max)}…（已截断，共 ${String(text.length)} 字符，完整内容见任务日志）`;
+}
+
+/**
+ * 用 MCP elicitation 询问用户是否允许一次规则外的操作。
+ * 客户端没有声明 elicitation 能力时不发请求，直接返回 unsupported（按拒绝处理）。
+ * 直接发 `elicitation/create` 而不用 SDK 的 elicitInput：旧版客户端只声明 `elicitation: {}`（等同表单），
+ * elicitInput 会因为缺少 `form` 字段而拒绝。
+ */
+function elicitationAsker(server: McpServer, timeoutMs: number): PermissionAsker {
+    return async ({ taskId, account, operation }, signal): Promise<AskAnswer> => {
+        if (server.server.getClientCapabilities()?.elicitation === undefined) return 'unsupported';
+        const what = KIND_TEXT[operation.kind] ?? `“${operation.kind}”类操作`;
+        const message =
+            `agy-fleet：任务 ${taskId}（账号 ${account}）请求${what}，超出权限规则：\n\n` +
+            `${clip(operation.target)}\n\n原因：${clip(operation.reason)}\n\n只允许这一次吗？不回应或取消都按拒绝处理。`;
+        try {
+            const result = await server.server.request(
+                {
+                    method: 'elicitation/create',
+                    params: {
+                        mode: 'form',
+                        message,
+                        requestedSchema: {
+                            type: 'object',
+                            properties: {
+                                decision: {
+                                    type: 'string',
+                                    title: '决定',
+                                    oneOf: [
+                                        { const: 'deny', title: '拒绝' },
+                                        { const: 'allow', title: '允许这一次' },
+                                    ],
+                                },
+                            },
+                            required: ['decision'],
+                        },
+                    },
+                },
+                ElicitResultSchema,
+                { timeout: timeoutMs, signal },
+            );
+            // 只有明确“接受且选了允许”才放行；其余（拒绝、取消、内容不符）一律按拒绝。
+            return result.action === 'accept' && result.content?.decision === 'allow' ? 'allow' : 'deny';
+        } catch (err) {
+            if (err instanceof McpError && err.code === REQUEST_TIMEOUT) return 'timeout';
+            log.warn('elicitation 失败，按拒绝处理', { task: taskId, error: String(err) });
+            return 'error';
+        }
+    };
+}
+
+/** 创建 MCP 服务器，工具全部委托给 TaskManager；规则外操作的询问经 elicitation 交给用户。 */
+export function createServer(manager: TaskManager, options: { askTimeoutMs?: number } = {}): McpServer {
+    const server = new McpServer({ name: 'agy-fleet', version: '0.3.0' });
+    manager.setPermissionAsker(elicitationAsker(server, options.askTimeoutMs ?? 300_000));
 
     server.registerTool(
         'run_task',
@@ -36,7 +103,8 @@ export function createServer(manager: TaskManager): McpServer {
             description:
                 '在一个新的 git worktree（独立分支）里让 Antigravity CLI 完成一个编码任务。' +
                 '默认等到本轮结束再返回；background=true 则立即返回 task_id，之后用 wait_task 取结果。' +
-                '工作进程只能在该 worktree 内改文件，不能执行命令；被拒绝的操作列在 denied 里。' +
+                '工作进程只能在该 worktree 内改文件、只能执行配置文件白名单里的命令；规则外的操作按配置拒绝或请用户确认，' +
+                '被拒绝的列在 denied 里，经用户批准的列在 approved 里。权限规则只能由使用者在配置文件里改，不能通过参数放宽。' +
                 '它不会 commit / push，请审查 worktree 的 diff 后自行合并；不满意用 send_message 返工，完成后 close_task。',
             inputSchema: {
                 prompt: z.string().min(1).describe('任务说明，需自包含：目标、涉及的文件、完成标准'),

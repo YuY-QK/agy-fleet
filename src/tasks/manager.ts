@@ -1,4 +1,6 @@
 import { randomBytes } from 'node:crypto';
+import type { RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
+import { realpathSync } from 'node:fs';
 import path from 'node:path';
 import { AccountStore, type AccountRecord } from '../accounts/store.ts';
 import { unlockAccountKeychain } from '../accounts/credStore.ts';
@@ -6,12 +8,17 @@ import { LeaseManager, type Lease } from '../accounts/lease.ts';
 import { listModels, type ModelInfo } from '../accounts/models.ts';
 import { Collector } from '../acp/collector.ts';
 import { AcpWorker } from '../acp/worker.ts';
-import type { FleetConfig } from '../config.ts';
+import { commandRulesFor, type FleetConfig } from '../config.ts';
 import { classifyFailure, FleetError, pauseScopeOf } from '../errors.ts';
 import { pidAlive } from '../fsutil.ts';
 import { createWorktree, diffStat, removeWorktree, type Worktree } from '../git/worktree.ts';
 import { log, openTaskLog, type TaskLog } from '../log.ts';
-import { judgePermission, toPermissionResponse, type DeniedOperation } from '../policy/permissions.ts';
+import {
+    judgePermission,
+    toPermissionResponse,
+    type ApprovedOperation,
+    type DeniedOperation,
+} from '../policy/permissions.ts';
 import { TaskStore, type TaskRecord, type TaskStatus, type TurnResult } from './store.ts';
 
 export interface RunTaskInput {
@@ -75,6 +82,22 @@ export interface AccountView {
     paused_models: Record<string, { code: string; reason: string; at: string }>;
 }
 
+/** 询问用户的结果。只有 `allow` 会放行；其余都按拒绝处理，并写明原因。 */
+export type AskAnswer = 'allow' | 'deny' | 'timeout' | 'unsupported' | 'error';
+
+/** 向用户询问一次规则外的操作（由 MCP 服务器经 elicitation 实现）。 */
+export type PermissionAsker = (
+    question: { taskId: string; account: string; operation: DeniedOperation },
+    signal: AbortSignal,
+) => Promise<AskAnswer>;
+
+const ASK_ANSWER_TEXT: Record<Exclude<AskAnswer, 'allow'>, string> = {
+    deny: '用户拒绝',
+    timeout: '询问用户超时',
+    unsupported: '客户端不支持弹窗确认（elicitation）',
+    error: '询问用户失败',
+};
+
 /** 追加在任务说明前的固定约束（PLAN §6.6）；只在会话的第一轮加。 */
 const WORKER_BRIEF = [
     '你是被派发来完成一个编码任务的工作进程。不要 commit、不要 push。',
@@ -89,12 +112,21 @@ interface Live {
     taskLog: TaskLog;
     collector: Collector;
     denied: DeniedOperation[];
+    approved: ApprovedOperation[];
     worker?: AcpWorker;
     lease?: Lease;
     abort?: AbortController;
     /** 当前这一轮；永不 reject，结束后状态已写入 record。 */
     turn?: Promise<void>;
     idleTimer?: NodeJS.Timeout;
+}
+
+function realOrResolved(p: string): string {
+    try {
+        return realpathSync(p);
+    } catch {
+        return path.resolve(p);
+    }
 }
 
 function newTaskId(): string {
@@ -113,6 +145,7 @@ export class TaskManager {
     readonly store: TaskStore;
     readonly #config: FleetConfig;
     readonly #live = new Map<string, Live>();
+    #asker: PermissionAsker | undefined;
 
     constructor(config: FleetConfig) {
         this.#config = config;
@@ -126,22 +159,15 @@ export class TaskManager {
         });
     }
 
-    /** 服务器启动时调用：登记环境变量指定的开发账号、按 AGY_FLEET_RESUME 解除暂停。 */
+    /** 服务器启动时调用：登记环境变量指定的开发账号。 */
     init(): void {
         const home = this.#config.envAccountHome;
         if (home !== undefined) this.accounts.ensure({ name: path.basename(home), home });
-        const resume = this.#config.resumeAccounts;
-        if (resume.includes('*')) {
-            this.accounts.resumeAll();
-        } else {
-            for (const name of resume) {
-                try {
-                    this.accounts.resume(name);
-                } catch (err) {
-                    log.warn('AGY_FLEET_RESUME 里的账号不存在', { name, error: String(err) });
-                }
-            }
-        }
+    }
+
+    /** 设置询问用户的方式（outside_policy 为 ask 时使用）；不设置则规则外的操作一律拒绝。 */
+    setPermissionAsker(asker: PermissionAsker | undefined): void {
+        this.#asker = asker;
     }
 
     // ---------- 账号 ----------
@@ -229,8 +255,10 @@ export class TaskManager {
             throw new FleetError('invalid_input', `repo 必须是绝对路径：${input.repo}`);
         }
         signal?.throwIfAborted();
+        const model = input.model ?? this.#config.defaultModel;
+        const effort = input.effort ?? this.#config.defaultEffort;
         const taskId = newTaskId();
-        const { account, lease } = this.#acquire(input.account, input.model, taskId);
+        const { account, lease } = this.#acquire(input.account, model, taskId);
 
         let worktree: Worktree;
         try {
@@ -250,8 +278,8 @@ export class TaskManager {
             account: account.name,
             repo: input.repo,
             description: input.description,
-            model: input.model,
-            effort: input.effort,
+            model,
+            effort,
         });
         taskLog.write('worktree_ready', { path: worktree.path, branch: worktree.branch, base: worktree.baseCommit });
 
@@ -260,8 +288,8 @@ export class TaskManager {
             id: taskId,
             status: 'running',
             account: account.name,
-            ...(input.model !== undefined ? { model: input.model } : {}),
-            ...(input.effort !== undefined ? { effort: input.effort } : {}),
+            ...(model !== undefined ? { model } : {}),
+            ...(effort !== undefined ? { effort } : {}),
             ...(input.description !== undefined ? { description: input.description } : {}),
             repo: input.repo,
             worktree,
@@ -397,7 +425,7 @@ export class TaskManager {
     // ---------- 内部：任务生命周期 ----------
 
     #adopt(record: TaskRecord, taskLog: TaskLog): Live {
-        const live: Live = { record, taskLog, collector: new Collector(), denied: [] };
+        const live: Live = { record, taskLog, collector: new Collector(), denied: [], approved: [] };
         this.#live.set(record.id, live);
         return live;
     }
@@ -440,6 +468,7 @@ export class TaskManager {
             if (signal.aborted) throw new FleetError('cancelled', '已取消');
 
             live.denied = [];
+            live.approved = [];
             collector.startTurn();
             const stopReason = await worker.runTurn(text, { timeoutMs: this.#config.turnTimeoutMs, signal });
             const diff = await diffStat(record.worktree);
@@ -448,6 +477,7 @@ export class TaskManager {
                 final_report: collector.finalText.trim(),
                 diff,
                 denied: live.denied,
+                approved: live.approved,
                 tool_calls: collector.toolCalls,
                 usage: collector.usage ?? null,
             };
@@ -491,22 +521,76 @@ export class TaskManager {
                     });
                 }
             },
-            onPermission: (request) => {
-                const verdict = judgePermission(request.toolCall, record.worktree.path);
-                if (verdict.allow) {
-                    taskLog.write('permission_allowed', { title: request.toolCall.title });
-                } else {
-                    live.denied.push(verdict.denied);
-                    taskLog.write('permission_denied', { ...verdict.denied });
-                }
-                return toPermissionResponse(request, verdict);
-            },
+            onPermission: (request) => this.#decidePermission(live, request),
             onTrace: (event, detail) => {
                 taskLog.write(event, detail);
             },
         });
         taskLog.write('session_ready', { session: worker.sessionId, resumed: record.sessionId !== undefined });
         return worker;
+    }
+
+    /**
+     * 处理一次权限请求：先按规则判定；规则外且可询问时，按 outside_policy 决定拒绝还是询问用户。
+     * 每次拒绝都进 denied，每次经用户批准都进 approved，两者都写任务日志。
+     */
+    async #decidePermission(live: Live, request: RequestPermissionRequest): Promise<RequestPermissionResponse> {
+        const { record, taskLog } = live;
+        const permissions = this.#config.permissions;
+        const verdict = judgePermission(request.toolCall, record.worktree.path, {
+            commands: commandRulesFor(permissions, record.worktree.repoRoot),
+            protectedRoots: this.#protectedRoots(record.account),
+        });
+        if (verdict.allow) {
+            taskLog.write('permission_allowed', {
+                title: request.toolCall.title,
+                ...(verdict.rule !== undefined ? { rule: verdict.rule } : {}),
+            });
+            return toPermissionResponse(request, true);
+        }
+        const operation = verdict.denied;
+        if (verdict.askable && permissions.outsidePolicy === 'ask') {
+            taskLog.write('permission_ask', { ...operation });
+            let answer: AskAnswer = 'unsupported';
+            if (this.#asker !== undefined) {
+                const signal = live.abort?.signal ?? new AbortController().signal;
+                try {
+                    answer = await this.#asker({ taskId: record.id, account: record.account, operation }, signal);
+                } catch (err) {
+                    log.warn('询问用户失败', { task: record.id, error: String(err) });
+                    answer = 'error';
+                }
+            }
+            if (answer === 'allow') {
+                const approved: ApprovedOperation = {
+                    kind: operation.kind,
+                    tool: operation.tool,
+                    target: operation.target,
+                    note: `规则外（${operation.reason}），经用户批准`,
+                };
+                live.approved.push(approved);
+                taskLog.write('permission_approved_by_user', { ...approved });
+                return toPermissionResponse(request, true);
+            }
+            const denied = { ...operation, reason: `${operation.reason}；${ASK_ANSWER_TEXT[answer]}` };
+            live.denied.push(denied);
+            taskLog.write('permission_denied', { ...denied });
+            return toPermissionResponse(request, false);
+        }
+        live.denied.push(operation);
+        taskLog.write('permission_denied', { ...operation });
+        return toPermissionResponse(request, false);
+    }
+
+    /**
+     * worktree 外即使用户同意也不允许修改的位置：agy-fleet 的数据目录、配置文件、账号库、账号目录、本任务账号的 HOME。
+     * 改这些等于让工作进程给自己放宽权限或拿到凭据。
+     */
+    #protectedRoots(accountName: string): string[] {
+        const config = this.#config;
+        const home = this.accounts.get(accountName)?.home;
+        const roots = [config.dataDir, config.accountsFile, config.accountsDir, config.configFile, home];
+        return roots.filter((p): p is string => p !== undefined).map(realOrResolved);
     }
 
     /** 一轮失败：分类、写日志、必要时暂停账号、回收子进程。worktree 与会话保留。 */

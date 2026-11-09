@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { RequestPermissionRequest } from '@agentclientprotocol/sdk';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { parseCommandRule } from './commands.ts';
 import { judgePermission, toPermissionResponse } from './permissions.ts';
 
 type ToolCall = RequestPermissionRequest['toolCall'];
@@ -92,6 +93,54 @@ describe('judgePermission：文件编辑', () => {
         expect(judgePermission(call, worktree).allow).toBe(false);
     });
 
+    it('越界路径可询问；.git、根目录、无法解析、没有路径不可询问', () => {
+        expect(judgePermission(edit(path.join(outside, 'secret.txt')), worktree)).toMatchObject({ askable: true });
+        expect(judgePermission(edit(path.join(worktree, 'dirlink', 'x.txt')), worktree)).toMatchObject({
+            askable: true,
+        });
+        expect(judgePermission(edit(path.join(worktree, '.git', 'config')), worktree)).toMatchObject({
+            askable: false,
+        });
+        expect(judgePermission(edit(path.join(worktree, '.GIT', 'hooks', 'pre-commit')), worktree)).toMatchObject({
+            askable: false,
+        });
+        expect(judgePermission(edit(worktree), worktree)).toMatchObject({ askable: false });
+        expect(judgePermission(edit(path.join(worktree, 'dangling')), worktree)).toMatchObject({ askable: false });
+        expect(judgePermission({ toolCallId: 't', kind: 'edit' }, worktree)).toMatchObject({ askable: false });
+    });
+
+    it('源仓库或别的仓库的 .git 也不可询问（任何 .git 段）', () => {
+        expect(judgePermission(edit(path.join(outside, '.git', 'hooks', 'pre-commit')), worktree)).toMatchObject({
+            allow: false,
+            askable: false,
+        });
+        expect(judgePermission(edit(path.join(worktree, 'sub', '.git', 'config')), worktree).allow).toBe(false);
+    });
+
+    it('受保护目录（agy-fleet 数据与配置、账号 HOME）即使询问也不放行', () => {
+        const rulesWithGuard = { protectedRoots: [outside] };
+        expect(judgePermission(edit(path.join(outside, 'config.yaml')), worktree, rulesWithGuard)).toMatchObject({
+            allow: false,
+            askable: false,
+        });
+        expect(judgePermission(edit(path.join(worktree, 'dirlink', 'x')), worktree, rulesWithGuard)).toMatchObject({
+            askable: false,
+        });
+        // worktree 本身位于受保护目录内（默认 worktree 根目录在数据目录下）时，worktree 内的编辑照常放行。
+        expect(judgePermission(edit(path.join(worktree, 'ok.txt')), worktree, { protectedRoots: [root] })).toEqual({
+            allow: true,
+        });
+    });
+
+    it('一次请求里同时有越界路径与 .git 路径时不可询问', () => {
+        const call: ToolCall = {
+            toolCallId: 't',
+            kind: 'edit',
+            locations: [{ path: path.join(outside, 'x.txt') }, { path: path.join(worktree, '.git', 'config') }],
+        };
+        expect(judgePermission(call, worktree)).toMatchObject({ allow: false, askable: false });
+    });
+
     it('请求里没有路径时拒绝', () => {
         expect(judgePermission({ toolCallId: 't', kind: 'edit' }, worktree).allow).toBe(false);
     });
@@ -105,6 +154,72 @@ describe('judgePermission：文件编辑', () => {
 });
 
 describe('judgePermission：命令与其他类别', () => {
+    const exec = (command: string): ToolCall => ({
+        toolCallId: 't',
+        kind: 'execute',
+        name: 'run_command',
+        rawInput: { CommandLine: command },
+    });
+    const rules = ['git status', 'git diff *'].map(parseCommandRule);
+
+    it('白名单为空时命令被拒（可询问），带上原文', () => {
+        expect(judgePermission(exec('git status'), worktree)).toMatchObject({
+            allow: false,
+            askable: true,
+            denied: { kind: 'execute', target: 'git status', reason: '命令白名单为空' },
+        });
+    });
+
+    it('命中白名单才允许，并带上命中的条目', () => {
+        expect(judgePermission(exec('git status'), worktree, { commands: rules })).toEqual({
+            allow: true,
+            rule: 'git status',
+        });
+        expect(judgePermission(exec('git diff --stat'), worktree, { commands: rules })).toEqual({
+            allow: true,
+            rule: 'git diff *',
+        });
+        expect(judgePermission(exec('git log'), worktree, { commands: rules })).toMatchObject({
+            allow: false,
+            askable: true,
+        });
+    });
+
+    it('组合命令绕不过白名单', () => {
+        for (const command of ['git status && rm -rf /', 'git status; curl x', 'git diff | sh', 'git diff $(id)']) {
+            expect(judgePermission(exec(command), worktree, { commands: rules }), command).toMatchObject({
+                allow: false,
+                askable: true,
+            });
+        }
+    });
+
+    it('命令请求若带工作目录字段，必须在 worktree 内才放行', () => {
+        const withCwd = (cwd: string): ToolCall => ({
+            toolCallId: 't',
+            kind: 'execute',
+            rawInput: { CommandLine: 'git status', Cwd: cwd },
+        });
+        expect(judgePermission(withCwd(worktree), worktree, { commands: rules }).allow).toBe(true);
+        expect(judgePermission(withCwd('src'), worktree, { commands: rules }).allow).toBe(true);
+        expect(judgePermission(withCwd(outside), worktree, { commands: rules })).toMatchObject({
+            allow: false,
+            askable: true,
+        });
+        expect(judgePermission(withCwd(path.join(worktree, 'dirlink')), worktree, { commands: rules }).allow).toBe(
+            false,
+        );
+    });
+
+    it('没有命令原文时直接拒绝，不可询问', () => {
+        expect(
+            judgePermission({ toolCallId: 't', kind: 'execute', title: '运行' }, worktree, { commands: rules }),
+        ).toMatchObject({
+            allow: false,
+            askable: false,
+        });
+    });
+
     it('命令一律拒绝并带上原文', () => {
         const v = judgePermission(
             { toolCallId: 't', kind: 'execute', name: 'run_command', rawInput: { CommandLine: 'echo a && ls' } },
@@ -116,7 +231,10 @@ describe('judgePermission：命令与其他类别', () => {
         });
     });
 
-    it('联网等其他类别拒绝；缺 kind 视为 other', () => {
+    it('联网等其他类别拒绝（可询问）；缺 kind 视为 other', () => {
+        expect(judgePermission({ toolCallId: 't', kind: 'fetch', title: 'GET x' }, worktree)).toMatchObject({
+            askable: true,
+        });
         expect(judgePermission({ toolCallId: 't', kind: 'fetch', title: 'GET x' }, worktree).allow).toBe(false);
         expect(judgePermission({ toolCallId: 't' }, worktree).allow).toBe(false);
     });
@@ -133,15 +251,14 @@ describe('toPermissionResponse', () => {
     };
 
     it('允许选 allow_once，拒绝选 reject_once', () => {
-        expect(toPermissionResponse(request, { allow: true })).toEqual({
+        expect(toPermissionResponse(request, true)).toEqual({
             outcome: { outcome: 'selected', optionId: 'allow' },
         });
-        const denied = { allow: false, denied: { kind: 'x', tool: 'x', target: 'x', reason: 'x' } } as const;
-        expect(toPermissionResponse(request, denied)).toEqual({ outcome: { outcome: 'selected', optionId: 'deny' } });
+        expect(toPermissionResponse(request, false)).toEqual({ outcome: { outcome: 'selected', optionId: 'deny' } });
     });
 
     it('没有 allow_once 选项时取消，不退而求其次选“总是允许”', () => {
         const always = { ...request, options: [{ optionId: 'always', name: 'Always', kind: 'allow_always' as const }] };
-        expect(toPermissionResponse(always, { allow: true })).toEqual({ outcome: { outcome: 'cancelled' } });
+        expect(toPermissionResponse(always, true)).toEqual({ outcome: { outcome: 'cancelled' } });
     });
 });

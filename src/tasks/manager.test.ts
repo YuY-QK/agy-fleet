@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { loadConfig, type FleetConfig } from '../config.ts';
 import { FleetError } from '../errors.ts';
+import { parseCommandRule } from '../policy/commands.ts';
 import { TaskManager } from './manager.ts';
 
 const mockAgent = path.join(import.meta.dirname, '..', 'acp', 'mock-agent.fixture.mjs');
@@ -397,7 +398,7 @@ describe('错误分类与暂停', () => {
         expect(manager.listAccounts()[0]?.status).toBe('paused');
     });
 
-    it('所有账号都被暂停时缺省选号返回 account_paused；resume 与 AGY_FLEET_RESUME 可解除', async () => {
+    it('所有账号都被暂停时缺省选号返回 account_paused；resume 可解除', async () => {
         const manager = setup(['a1']);
         mock('authexp');
         await code(manager.runTask({ prompt: 'x', repo }));
@@ -406,13 +407,6 @@ describe('错误分类与暂停', () => {
 
         manager.accounts.resume('a1');
         expect((await manager.runTask({ prompt: 'x', repo })).status).toBe('idle');
-
-        mock('authexp');
-        await code(manager.runTask({ prompt: 'x', repo }));
-        mock('work');
-        const restarted = newManager({ resumeAccounts: ['a1'] });
-        restarted.init();
-        expect((await restarted.runTask({ prompt: 'x', repo })).status).toBe('idle');
     });
 
     it('超时、取消不暂停账号', async () => {
@@ -437,5 +431,133 @@ describe('开发账号登记与恢复', () => {
         const manager = newManager({ envAccountHome: home });
         manager.init();
         expect(manager.accounts.list()).toEqual([{ name: 'dev', home }]);
+    });
+});
+
+describe('权限规则与询问用户（outside_policy）', () => {
+    const permissions = (
+        outsidePolicy: 'deny' | 'ask',
+        commands: string[] = [],
+        repoCommands: [string, string[]][] = [],
+    ): FleetConfig['permissions'] => ({
+        outsidePolicy,
+        askTimeoutMs: 1000,
+        commands: commands.map(parseCommandRule),
+        repoCommands: new Map(repoCommands.map(([k, v]) => [k, v.map(parseCommandRule)])),
+    });
+    const outsidePath = (): string => path.join(root, 'outside.txt');
+
+    it('deny：越界编辑与非白名单命令都被拒并进 denied 与日志；不询问用户', async () => {
+        const manager = setup(['a1'], { permissions: permissions('deny', ['git status']) });
+        const asked: string[] = [];
+        manager.setPermissionAsker((q) => {
+            asked.push(q.operation.target);
+            return Promise.resolve('allow');
+        });
+        mock('ok', { MOCK_EDIT_PATH: outsidePath(), MOCK_COMMAND: 'git status && rm -rf /' });
+        const task = await manager.runTask({ prompt: 'x', repo });
+        expect(task.final_report).toContain('选择:deny,deny');
+        expect(task.denied?.map((d) => d.target)).toEqual([outsidePath(), 'git status && rm -rf /']);
+        expect(task.approved).toEqual([]);
+        expect(asked).toEqual([]);
+        const logText = readFileSync(task.log_file, 'utf8');
+        expect(logText.match(/permission_denied/g)).toHaveLength(2);
+    });
+
+    it('白名单（全局 + 按仓库）命中的命令被放行，worktree 内编辑放行', async () => {
+        const manager = setup(['a1'], { permissions: permissions('deny', [], [[repo, ['pnpm test']]]) });
+        mock('ok', { MOCK_COMMAND: 'pnpm test', MOCK_EDIT_PATH: 'inside.txt' });
+        const task = await manager.runTask({ prompt: 'x', repo });
+        expect(task.final_report).toContain('选择:allow,allow');
+        expect(task.denied).toEqual([]);
+        expect(readFileSync(task.log_file, 'utf8')).toContain('"rule":"pnpm test"');
+    });
+
+    it('按仓库的白名单不作用于别的仓库', async () => {
+        const manager = setup(['a1'], { permissions: permissions('deny', [], [['/some/other/repo', ['pnpm test']]]) });
+        mock('ok', { MOCK_COMMAND: 'pnpm test', MOCK_EDIT_PATH: 'inside.txt' });
+        const task = await manager.runTask({ prompt: 'x', repo });
+        expect(task.final_report).toContain('选择:allow,deny');
+    });
+
+    it('ask：用户批准的放行并进 approved 与日志，用户拒绝的进 denied', async () => {
+        const manager = setup(['a1'], { permissions: permissions('ask') });
+        const questions: { taskId: string; account: string; kind: string }[] = [];
+        manager.setPermissionAsker((q) => {
+            questions.push({ taskId: q.taskId, account: q.account, kind: q.operation.kind });
+            return Promise.resolve(q.operation.kind === 'edit' ? 'allow' : 'deny');
+        });
+        mock('ok', { MOCK_EDIT_PATH: outsidePath(), MOCK_COMMAND: 'curl x' });
+        const task = await manager.runTask({ prompt: 'x', repo });
+        expect(task.final_report).toContain('选择:allow,deny');
+        expect(questions).toEqual([
+            { taskId: task.task_id, account: 'a1', kind: 'edit' },
+            { taskId: task.task_id, account: 'a1', kind: 'execute' },
+        ]);
+        expect(task.approved).toMatchObject([{ kind: 'edit', target: outsidePath() }]);
+        expect(task.denied).toMatchObject([{ kind: 'execute', target: 'curl x' }]);
+        expect(task.denied?.[0]?.reason).toContain('用户拒绝');
+        const logText = readFileSync(task.log_file, 'utf8');
+        expect(logText).toContain('permission_approved_by_user');
+        expect(logText.match(/permission_ask/g)).toHaveLength(2);
+    });
+
+    it.each([
+        ['timeout', '超时'],
+        ['unsupported', '不支持'],
+        ['error', '失败'],
+    ] as const)('ask：%s 按拒绝处理并写明原因', async (answer, text) => {
+        const manager = setup(['a1'], { permissions: permissions('ask') });
+        manager.setPermissionAsker(() => Promise.resolve(answer));
+        mock('ok', { MOCK_EDIT_PATH: outsidePath() });
+        const task = await manager.runTask({ prompt: 'x', repo });
+        expect(task.final_report).toContain('选择:deny,deny');
+        expect(task.denied).toHaveLength(2);
+        for (const d of task.denied ?? []) expect(d.reason).toContain(text);
+    });
+
+    it('ask：没有设置询问方式、或询问抛错，都按拒绝处理', async () => {
+        const manager = setup(['a1'], { permissions: permissions('ask') });
+        mock('ok', { MOCK_EDIT_PATH: outsidePath() });
+        const first = await manager.runTask({ prompt: 'x', repo });
+        expect(first.denied?.[0]?.reason).toContain('不支持');
+        manager.setPermissionAsker(() => Promise.reject(new Error('boom')));
+        const second = await manager.runTask({ prompt: 'x', repo });
+        expect(second.final_report).toContain('选择:deny,deny');
+        expect(second.denied?.[0]?.reason).toContain('失败');
+    });
+
+    it('ask：改 agy-fleet 的配置文件、账号库或账号 HOME 直接拒绝，不询问用户', async () => {
+        const manager = setup(['a1'], { permissions: permissions('ask', ['echo hi']) });
+        const asked: string[] = [];
+        manager.setPermissionAsker((q) => {
+            asked.push(q.operation.target);
+            return Promise.resolve('allow');
+        });
+        for (const target of [
+            path.join(root, 'data', 'config.yaml'),
+            path.join(root, 'data', 'accounts.json'),
+            path.join(root, 'homes', 'a1', '.gemini', 'settings.json'),
+        ]) {
+            mock('ok', { MOCK_EDIT_PATH: target });
+            const task = await manager.runTask({ prompt: 'x', repo });
+            expect(task.final_report, target).toContain('选择:deny,allow');
+            expect(task.denied?.[0]?.reason).toContain('受保护');
+        }
+        expect(asked).toEqual([]);
+    });
+
+    it('ask：.git 内的编辑直接拒绝，不询问用户', async () => {
+        const manager = setup(['a1'], { permissions: permissions('ask', ['echo hi']) });
+        const asked: string[] = [];
+        manager.setPermissionAsker((q) => {
+            asked.push(q.operation.target);
+            return Promise.resolve('allow');
+        });
+        mock('ok', { MOCK_EDIT_PATH: '.git/config' });
+        const task = await manager.runTask({ prompt: 'x', repo });
+        expect(task.final_report).toContain('选择:deny,allow');
+        expect(asked).toEqual([]);
+        expect(task.denied?.[0]?.reason).toContain('.git');
     });
 });

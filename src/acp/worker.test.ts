@@ -44,7 +44,7 @@ describe('AcpWorker', () => {
                 onPermission: (request) => {
                     const verdict = judgePermission(request.toolCall, worktree);
                     if (!verdict.allow) denied.push(verdict.denied.kind);
-                    return toPermissionResponse(request, verdict);
+                    return toPermissionResponse(request, verdict.allow);
                 },
             }),
         );

@@ -18,7 +18,7 @@ async function main(): Promise<void> {
     const config = loadConfig();
     const manager = new TaskManager(config);
     manager.init();
-    const server = createServer(manager);
+    const server = createServer(manager, { askTimeoutMs: config.permissions.askTimeoutMs });
 
     // 客户端断开（stdin 关闭）或收到信号：取消在跑的轮次、回收子进程、释放租约，然后退出。
     let stopping = false;
@@ -41,7 +41,12 @@ async function main(): Promise<void> {
     });
 
     await server.connect(new StdioServerTransport());
-    log.info('agy-fleet MCP 服务器已启动', { accounts: manager.accounts.list().map((a) => a.name) });
+    log.info('agy-fleet MCP 服务器已启动', {
+        accounts: manager.accounts.list().map((a) => a.name),
+        config: config.configFile ?? '(无配置文件)',
+        outsidePolicy: config.permissions.outsidePolicy,
+        commandRules: config.permissions.commands.length,
+    });
 }
 
 main().catch((err: unknown) => {

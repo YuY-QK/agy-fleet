@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { ToolCallRecord, UsageSnapshot } from '../acp/collector.ts';
 import { writeFileAtomic } from '../fsutil.ts';
 import type { DiffStat, Worktree } from '../git/worktree.ts';
-import type { DeniedOperation } from '../policy/permissions.ts';
+import type { ApprovedOperation, DeniedOperation } from '../policy/permissions.ts';
 
 // 任务记录：每个任务一个 JSON 文件，进程重启后仍可查看。
 // 状态机：running → idle（本轮结束，等待审查）→ running … → closed；出错为 failed（带错误码）。
@@ -17,6 +17,8 @@ export interface TurnResult {
     final_report: string;
     diff: DiffStat;
     denied: DeniedOperation[];
+    /** 规则外、经用户批准的操作（outside_policy 为 ask 时才会有）。旧记录可能没有这个字段。 */
+    approved?: ApprovedOperation[];
     tool_calls: ToolCallRecord[];
     usage: UsageSnapshot | null;
 }
