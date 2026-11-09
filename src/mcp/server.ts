@@ -1,42 +1,193 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import type { FleetConfig } from '../config.ts';
 import { FleetError } from '../errors.ts';
 import { log } from '../log.ts';
-import { runTask } from '../tasks/run.ts';
+import type { TaskManager } from '../tasks/manager.ts';
 
-/** 创建 MCP 服务器。M1 只有前台 `run_task`。 */
-export function createServer(config: FleetConfig): McpServer {
-    const server = new McpServer({ name: 'agy-fleet', version: '0.1.0' });
+const STATUS = z.enum(['running', 'idle', 'failed', 'closed']);
+
+function ok(payload: unknown): CallToolResult {
+    return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
+}
+
+/** 失败统一为 MCP 工具错误：code、message，可选 task_id 与部分输出（PLAN §7）。 */
+function fail(tool: string, err: unknown): CallToolResult {
+    const code = err instanceof FleetError ? err.code : 'agent_crashed';
+    const message = err instanceof Error ? err.message : String(err);
+    log.error(`${tool} 失败`, { code, message });
+    const body = {
+        code,
+        message,
+        ...(err instanceof FleetError && err.taskId !== undefined ? { task_id: err.taskId } : {}),
+        ...(err instanceof FleetError && err.partial !== undefined ? { partial_report: err.partial } : {}),
+    };
+    return { isError: true, content: [{ type: 'text', text: JSON.stringify(body, null, 2) }] };
+}
+
+/** 创建 MCP 服务器，工具全部委托给 TaskManager。 */
+export function createServer(manager: TaskManager): McpServer {
+    const server = new McpServer({ name: 'agy-fleet', version: '0.2.0' });
 
     server.registerTool(
         'run_task',
         {
             title: '派发编码任务给 agy',
             description:
-                '在一个新的 git worktree（独立分支）里让 Antigravity CLI 完成一个编码任务，等到本轮结束后返回。' +
+                '在一个新的 git worktree（独立分支）里让 Antigravity CLI 完成一个编码任务。' +
+                '默认等到本轮结束再返回；background=true 则立即返回 task_id，之后用 wait_task 取结果。' +
                 '工作进程只能在该 worktree 内改文件，不能执行命令；被拒绝的操作列在 denied 里。' +
-                '它不会 commit / push，请审查 worktree 的 diff 后自行合并。',
+                '它不会 commit / push，请审查 worktree 的 diff 后自行合并；不满意用 send_message 返工，完成后 close_task。',
             inputSchema: {
                 prompt: z.string().min(1).describe('任务说明，需自包含：目标、涉及的文件、完成标准'),
                 repo: z.string().min(1).describe('目标 git 仓库（或其内任意子目录）的绝对路径'),
-                description: z.string().optional().describe('一句话任务描述，仅用于日志'),
+                description: z.string().optional().describe('一句话任务描述，用于日志和 list_tasks'),
                 base: z.string().optional().describe('worktree 的基准提交或分支，默认当前 HEAD'),
+                account: z.string().optional().describe('指定账号名；缺省时从账号库取空闲账号（见 list_accounts）'),
+                model: z.string().optional().describe('模型 id（见 list_models）；缺省沿用 agy 默认'),
+                effort: z
+                    .string()
+                    .optional()
+                    .describe('推理强度（如 low/medium/high，可选档位随模型而异）；缺省沿用默认'),
+                background: z.boolean().optional().describe('true：立即返回，用 wait_task 取结果'),
             },
         },
         async (args, extra) => {
             try {
-                const result = await runTask(
-                    config,
-                    { prompt: args.prompt, repo: args.repo, base: args.base, description: args.description },
-                    extra.signal,
-                );
-                return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+                return ok(await manager.runTask(args, extra.signal));
             } catch (err) {
-                const code = err instanceof FleetError ? err.code : 'agent_crashed';
-                const message = err instanceof Error ? err.message : String(err);
-                log.error('run_task 失败', { code, message });
-                return { isError: true, content: [{ type: 'text', text: JSON.stringify({ code, message }, null, 2) }] };
+                return fail('run_task', err);
+            }
+        },
+    );
+
+    server.registerTool(
+        'send_message',
+        {
+            title: '在同一会话里追加指示（返工）',
+            description:
+                '对状态为 idle（或已失败但有会话）的任务追加一轮指示，保留之前的全部上下文。' +
+                '子进程已因空闲关闭时会自动用 session/load 恢复会话。',
+            inputSchema: {
+                task_id: z.string().min(1),
+                message: z.string().min(1).describe('修改意见，需自包含'),
+                background: z.boolean().optional().describe('true：立即返回，用 wait_task 取结果'),
+            },
+        },
+        async (args, extra) => {
+            try {
+                return ok(
+                    await manager.sendMessage(args.task_id, args.message, args.background === true, extra.signal),
+                );
+            } catch (err) {
+                return fail('send_message', err);
+            }
+        },
+    );
+
+    server.registerTool(
+        'wait_task',
+        {
+            title: '等待任务本轮结束',
+            description:
+                '等待后台任务本轮结束。单次等待有上限；超时返回 still_running=true 而不是报错，可再次调用。' +
+                '任务失败时返回工具错误（带错误码与 task_id）。',
+            inputSchema: {
+                task_id: z.string().min(1),
+                timeout_s: z.number().positive().optional().describe('本次最多等待的秒数（有上限）'),
+            },
+        },
+        async (args) => {
+            try {
+                const outcome = await manager.waitTask(args.task_id, args.timeout_s);
+                return ok({ still_running: outcome.still_running, ...outcome.task });
+            } catch (err) {
+                return fail('wait_task', err);
+            }
+        },
+    );
+
+    server.registerTool(
+        'list_tasks',
+        {
+            title: '列出任务',
+            description: '列出任务（含已重启前的）：状态、账号、已运行时长、最近动作。',
+            inputSchema: { status: STATUS.optional().describe('只看某个状态') },
+        },
+        (args) => {
+            try {
+                return ok(manager.listTasks(args.status));
+            } catch (err) {
+                return fail('list_tasks', err);
+            }
+        },
+    );
+
+    server.registerTool(
+        'cancel_task',
+        {
+            title: '取消正在运行的一轮',
+            description:
+                '取消任务当前这一轮并结束子进程。任务变为 failed(cancelled)，worktree 与会话保留，之后仍可 send_message 继续或 close_task 清理。',
+            inputSchema: { task_id: z.string().min(1) },
+        },
+        async (args) => {
+            try {
+                return ok(await manager.cancelTask(args.task_id));
+            } catch (err) {
+                return fail('cancel_task', err);
+            }
+        },
+    );
+
+    server.registerTool(
+        'close_task',
+        {
+            title: '关闭任务并清理',
+            description:
+                '关闭任务的会话并删除 worktree。分支默认保留（合并前不要删）；delete_branch=true 一并删除分支。',
+            inputSchema: {
+                task_id: z.string().min(1),
+                delete_branch: z.boolean().optional().describe('同时删除分支 agy-fleet/<task_id>'),
+            },
+        },
+        async (args) => {
+            try {
+                return ok(await manager.closeTask(args.task_id, args.delete_branch === true));
+            } catch (err) {
+                return fail('close_task', err);
+            }
+        },
+    );
+
+    server.registerTool(
+        'list_accounts',
+        {
+            title: '列出账号',
+            description: '账号库里的账号：状态（idle/busy/paused）、暂停原因、正在跑的任务。',
+            inputSchema: {},
+        },
+        () => {
+            try {
+                return ok(manager.listAccounts());
+            } catch (err) {
+                return fail('list_accounts', err);
+            }
+        },
+    );
+
+    server.registerTool(
+        'list_models',
+        {
+            title: '列出可用模型',
+            description: '用某个账号查询可用模型（缺省取账号库第一个账号）及常见的推理强度。',
+            inputSchema: { account: z.string().optional() },
+        },
+        async (args) => {
+            try {
+                return ok(await manager.listModels(args.account));
+            } catch (err) {
+                return fail('list_models', err);
             }
         },
     );

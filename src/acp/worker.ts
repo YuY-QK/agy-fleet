@@ -9,7 +9,8 @@ import { FleetError } from '../errors.ts';
 import { AgentProcess } from './process.ts';
 
 // 一个 ACP 会话的客户端侧。协议流程取自 spike/acp_probe*.py 与 docs/acp-验证结论.md：
-//   initialize → session/new → session/prompt（期间收 session/update 通知、回应 session/request_permission）。
+//   initialize → session/new（或 session/load 恢复旧会话）→ [session/set_config_option] → session/prompt
+//   （期间收 session/update 通知、回应 session/request_permission）。
 // 传输是“每行一个 JSON-RPC 消息”的 stdio；这里自带一个很小的 JSON-RPC 对端，不依赖 SDK 的连接层，
 // 只借用 SDK 的类型定义。
 
@@ -22,6 +23,7 @@ const DRAIN_WAIT_MS = 200;
 const AUTH_HINT = /auth|log ?in|credential|unauthori[sz]ed|token|sign ?in/i;
 
 const METHOD_NOT_FOUND = -32601;
+const INVALID_PARAMS = -32602;
 
 export type PermissionHandler = (
     request: RequestPermissionRequest,
@@ -38,6 +40,11 @@ export interface WorkerOptions {
     /** 协议流量的一行摘要，用于任务日志（不含完整内容）。 */
     onTrace?: (event: string, detail?: Record<string, unknown>) => void;
     handshakeTimeoutMs?: number;
+    /** 给了就用 `session/load` 恢复这个会话，而不是新建。 */
+    resumeSessionId?: string;
+    /** 会话的模型与推理强度；不给则沿用 agy 默认。无效值会以 `invalid_input` 失败。 */
+    model?: string;
+    effort?: string;
 }
 
 export interface TurnOptions {
@@ -55,6 +62,7 @@ interface Pending {
 interface RpcError {
     code?: number;
     message?: string;
+    data?: unknown;
 }
 
 type Json = Record<string, unknown>;
@@ -94,10 +102,38 @@ export class AcpWorker {
                 },
                 timeout,
             );
-            const created = await link.call('session/new', { cwd: options.cwd, mcpServers: [] }, timeout);
-            const sessionId = isObject(created) ? created.sessionId : undefined;
-            if (typeof sessionId !== 'string' || sessionId === '') {
-                throw new FleetError('agent_crashed', 'session/new 的应答里没有 sessionId');
+            let sessionId: string;
+            if (options.resumeSessionId !== undefined) {
+                sessionId = options.resumeSessionId;
+                // agent 会把历史对话作为 session/update 重放一遍；这些不是本轮的内容，丢弃。
+                link.muteUpdates(true);
+                try {
+                    await link.call('session/load', { sessionId, cwd: options.cwd, mcpServers: [] }, timeout);
+                } finally {
+                    link.muteUpdates(false);
+                }
+            } else {
+                const created = await link.call('session/new', { cwd: options.cwd, mcpServers: [] }, timeout);
+                const id = isObject(created) ? created.sessionId : undefined;
+                if (typeof id !== 'string' || id === '') {
+                    throw new FleetError('agent_crashed', 'session/new 的应答里没有 sessionId');
+                }
+                sessionId = id;
+            }
+            // 先设模型再设推理强度：可选的强度档位取决于当前模型。
+            if (options.model !== undefined) {
+                await link.call(
+                    'session/set_config_option',
+                    { sessionId, configId: 'model', value: options.model },
+                    timeout,
+                );
+            }
+            if (options.effort !== undefined) {
+                await link.call(
+                    'session/set_config_option',
+                    { sessionId, configId: 'thought_level', value: options.effort },
+                    timeout,
+                );
             }
             return new AcpWorker(proc, link, sessionId);
         } catch (err) {
@@ -158,6 +194,11 @@ export class AcpWorker {
         }
     }
 
+    /** 子进程是否还活着（空闲期间它可能自己退出了）。 */
+    get alive(): boolean {
+        return this.#proc.running;
+    }
+
     async close(): Promise<void> {
         this.#link.shutdown();
         await this.#proc.terminate();
@@ -183,6 +224,7 @@ class Link {
     #nextId = 1;
     #pending = new Map<number, Pending>();
     #cancelling = false;
+    #muted = false;
     #closed = false;
     #buffer = '';
 
@@ -217,6 +259,10 @@ class Link {
         this.#cancelling = value;
     }
 
+    muteUpdates(value: boolean): void {
+        this.#muted = value;
+    }
+
     shutdown(): void {
         this.#closed = true;
         this.#failAll(new FleetError('cancelled', '连接已关闭'));
@@ -224,8 +270,8 @@ class Link {
 
     call(method: string, params: unknown, timeoutMs?: number): Promise<unknown> {
         return new Promise((resolve, reject) => {
-            if (this.#closed) {
-                reject(new FleetError('agent_crashed', 'agy 连接已关闭'));
+            if (this.#closed || !this.#proc.running) {
+                reject(new FleetError('agent_crashed', 'agy 连接已关闭或进程已退出'));
                 return;
             }
             const id = this.#nextId++;
@@ -298,10 +344,12 @@ class Link {
         if (entry.timer !== undefined) clearTimeout(entry.timer);
         if (isObject(message.error)) {
             const error = message.error as RpcError;
+            // 附上 data 的原文：额度、认证类错误的细节常在这里，分类和排查都靠它。
+            const data = error.data === undefined ? '' : ` ${JSON.stringify(error.data).slice(0, 1000)}`;
             entry.reject(
                 new FleetError(
-                    'agent_crashed',
-                    `${entry.method} 失败：${error.message ?? '未知错误'}（${String(error.code)}）`,
+                    error.code === INVALID_PARAMS ? 'invalid_input' : 'agent_crashed',
+                    `${entry.method} 失败：${error.message ?? '未知错误'}（${String(error.code)}）${data}`,
                 ),
             );
         } else {
@@ -310,7 +358,7 @@ class Link {
     }
 
     #onNotification(method: string, params: unknown): void {
-        if (method !== 'session/update') return;
+        if (method !== 'session/update' || this.#muted) return;
         try {
             this.#options.onUpdate(params as SessionNotification);
         } catch (err) {

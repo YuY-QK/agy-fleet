@@ -95,4 +95,88 @@ describe('AcpWorker', () => {
             await worker.close();
         }
     });
+
+    it('model/effort 通过 session/set_config_option 设置；无效值归为 invalid_input', async () => {
+        const collector = new Collector();
+        const worker = await AcpWorker.start(
+            options('work', {
+                model: 'claude-sonnet-4-6',
+                effort: 'high',
+                onUpdate: (n: SessionNotification) => {
+                    collector.handle(n);
+                },
+            }),
+        );
+        try {
+            collector.startTurn();
+            await worker.runTurn('go', { timeoutMs: 10_000 });
+            expect(collector.text).toContain('model=claude-sonnet-4-6 effort=high');
+        } finally {
+            await worker.close();
+        }
+        expect((await failure(AcpWorker.start(options('work', { model: 'bad' })))).code).toBe('invalid_input');
+    });
+
+    it('新进程用 session/load 恢复会话：历史重放不进本轮输出，对话得以延续', async () => {
+        const stateDir = mkdtempSync(path.join(os.tmpdir(), 'agy-fleet-mockstate-'));
+        const env = {
+            PATH: process.env.PATH ?? '',
+            MOCK_MODE: 'work',
+            MOCK_STATE_DIR: stateDir,
+            MOCK_SESSION_ID: 'sess-1',
+        };
+        const first = new Collector();
+        const a = await AcpWorker.start(
+            options('work', {
+                env,
+                onUpdate: (n: SessionNotification) => {
+                    first.handle(n);
+                },
+            }),
+        );
+        try {
+            first.startTurn();
+            await a.runTurn('第一轮', { timeoutMs: 10_000 });
+            expect(first.text).toContain('loaded=false turns=1');
+        } finally {
+            await a.close();
+        }
+
+        const second = new Collector();
+        const b = await AcpWorker.start(
+            options('work', {
+                env,
+                resumeSessionId: a.sessionId,
+                onUpdate: (n: SessionNotification) => {
+                    second.handle(n);
+                },
+            }),
+        );
+        try {
+            expect(b.sessionId).toBe('sess-1');
+            second.startTurn();
+            await b.runTurn('第二轮', { timeoutMs: 10_000 });
+            // 同一会话的第 2 轮；重放的“旧历史”没有混进来
+            expect(second.text).toBe('完成。loaded=true turns=2 model=default effort=default');
+        } finally {
+            await b.close();
+        }
+    });
+
+    it('恢复一个不存在的会话会失败', async () => {
+        const stateDir = mkdtempSync(path.join(os.tmpdir(), 'agy-fleet-mockstate-'));
+        const env = { PATH: process.env.PATH ?? '', MOCK_MODE: 'work', MOCK_STATE_DIR: stateDir };
+        const error = await failure(AcpWorker.start(options('work', { env, resumeSessionId: 'nope' })));
+        expect(error.message).toContain('session not found');
+    });
+
+    it('session/prompt 的错误应答带上 data 原文', async () => {
+        const worker = await AcpWorker.start(options('quota'));
+        try {
+            const error = await failure(worker.runTurn('go', { timeoutMs: 5000 }));
+            expect(error.message).toContain('RESOURCE_EXHAUSTED');
+        } finally {
+            await worker.close();
+        }
+    });
 });

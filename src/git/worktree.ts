@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdirSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { FleetError } from '../errors.ts';
@@ -55,10 +55,23 @@ export async function createWorktree(options: {
     return { path: realpathSync(wtPath), branch, baseCommit, repoRoot };
 }
 
-/** 删除 worktree；`deleteBranch` 为真时一并删分支。M1 暂不对外暴露，留给 close_task。 */
+/** 删除 worktree；`deleteBranch` 为真时一并删分支。目录或分支已不存在时视为已完成。 */
 export async function removeWorktree(wt: Worktree, deleteBranch: boolean): Promise<void> {
-    await git(wt.repoRoot, ['worktree', 'remove', '--force', wt.path]);
-    if (deleteBranch) await git(wt.repoRoot, ['branch', '-D', wt.branch]);
+    if (existsSync(wt.path)) {
+        await git(wt.repoRoot, ['worktree', 'remove', '--force', wt.path]);
+    } else {
+        await git(wt.repoRoot, ['worktree', 'prune']);
+    }
+    if (deleteBranch && (await branchExists(wt))) await git(wt.repoRoot, ['branch', '-D', wt.branch]);
+}
+
+async function branchExists(wt: Worktree): Promise<boolean> {
+    try {
+        await git(wt.repoRoot, ['rev-parse', '--verify', '--quiet', `refs/heads/${wt.branch}`]);
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 /**
