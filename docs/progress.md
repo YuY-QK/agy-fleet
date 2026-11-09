@@ -26,7 +26,7 @@
 - 新增测试：`acp/process.test.ts`（孙进程回收、忽略 SIGTERM 强杀、组长退出后清扫、命令不存在）、`acp/worker.test.ts`（用 `mock-agent.fixture.mjs` 模拟 agent：握手+权限应答、认证失败、握手超时、崩溃、单轮超时、取消）。
 - 验证：`pnpm typecheck`、`lint`、`fmt:check`、`test`（30 项）、`build` 通过；MCP 客户端经 stdio 调新构建产物（acct1）：新建文件 `end_turn`、diff `hello.txt +1/-0`；执行命令被拒，`denied` 含 `execute / run_command / echo hi > from_cmd.txt`；无残留 agy 进程。
 
-- **M2 多账号与续聊：已完成**（本地提交，**尚未推送**；端到端五项已全部完成）。
+- **M2 多账号与续聊：已完成**（已推送到 `YuY-QK/agy-fleet`，提交 `6e86e55` 的 GitHub Actions CI 通过；端到端五项已全部完成）。
   - 新增：`accounts/{store,lease,models}`、`tasks/{store,manager}`、`errors.ts`（错误码全集、分类、暂停粒度）、`fsutil.ts`（文件锁/原子写/pid 检查）；`acp/worker` 增加 `session/load` 恢复与 `model`/`effort`（`session/set_config_option`）；`mcp/server` 提供 PLAN §7 全部 8 个工具；`tasks/run.ts` 由 `manager.ts` 取代。细化决定见 PLAN 变更记录 v1.2。
   - 默认值（待你确认，可用环境变量改）：每账号并发 1、全局并发 4、空闲超时 30 分钟、单轮超时 30 分钟、租约心跳 5s/过期 30s、`wait_task` 默认 45s/上限 300s。
   - 验证（2026-11-09）：`pnpm typecheck`、`lint`、`fmt:check`、`test`（97 项）、`build` 通过。新增测试覆盖：租约（同进程上限、全局上限、心跳过期、**6 个真实子进程同时抢占只有 1 个成功**、**SIGKILL 持有者后回收**、心跳续命）、账号库与暂停粒度、错误分类、状态机非法转移、后台 `wait_task` 超时/取消/关闭、空闲超时后 `session/load` 续聊、重启后查看与接手、跨进程只读、模拟额度/认证错误的暂停与恢复、MCP 工具端到端（内存传输）。
@@ -44,7 +44,7 @@
 
 ## 计划
 
-- ~~M2 多账号与续聊~~（已完成，余①两账号并行真实验证）。
+- ~~M2 多账号与续聊~~（已完成）。
 - M3 账号命令与权限：`account`/`doctor`、平台凭据处理、权限规则 + elicitation。
 - M4 发布：编排 prompt 与 skill、README（英/中）、npm 发布。
 详见 [PLAN_v1.1.md](PLAN_v1.1.md) §9。
