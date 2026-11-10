@@ -123,3 +123,83 @@ export function matchCommand(
     }
     return { matched: false, reason: rules.length === 0 ? '命令白名单为空' : '不在命令白名单内' };
 }
+
+/**
+ * 启动器 / 解释器：它们的参数本身就能指定要执行的代码（如 `git -c alias.x=!cmd x`、`find -exec`、`node -e`、
+ * `env cmd`、`xargs cmd`、`ssh host cmd`）。这类命令的 `*` 条目等于允许任意代码执行。
+ */
+const LAUNCHERS = new Set([
+    'git',
+    'find',
+    'node',
+    'nodejs',
+    'npm',
+    'npx',
+    'pnpm',
+    'pnpx',
+    'yarn',
+    'bun',
+    'bunx',
+    'deno',
+    'corepack',
+    'env',
+    'xargs',
+    'sh',
+    'bash',
+    'zsh',
+    'dash',
+    'ksh',
+    'fish',
+    'csh',
+    'tcsh',
+    'ssh',
+    'scp',
+    'rsync',
+    'sudo',
+    'doas',
+    'su',
+    'perl',
+    'ruby',
+    'php',
+    'lua',
+    'awk',
+    'gawk',
+    'sed',
+    'make',
+    'cmake',
+    'cargo',
+    'go',
+    'java',
+    'uv',
+    'uvx',
+    'pipx',
+    'osascript',
+    'open',
+    'nohup',
+    'nice',
+    'time',
+    'timeout',
+    'watch',
+    'exec',
+    'eval',
+    'command',
+    'builtin',
+    'source',
+    'docker',
+    'kubectl',
+    'vim',
+    'vi',
+    'nvim',
+    'emacs',
+    'tar',
+]);
+/** 带版本号的解释器名，如 python3、python3.12、pip3。 */
+const VERSIONED_LAUNCHER = /^(python|pip|ruby|perl|node|php|lua)[0-9.]*$/;
+
+/** 这条规则是否是“启动器 / 解释器 + `*`”：首个词（取文件名）属于上面的清单，且允许追加参数。 */
+export function isLauncherWildcard(rule: CommandRule): boolean {
+    if (!rule.allowExtraArgs) return false;
+    const first = rule.words[0] ?? '';
+    const name = first.slice(first.lastIndexOf('/') + 1).toLowerCase();
+    return LAUNCHERS.has(name) || VERSIONED_LAUNCHER.test(name);
+}

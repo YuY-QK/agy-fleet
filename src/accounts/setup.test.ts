@@ -7,6 +7,7 @@ import {
     readlinkSync,
     realpathSync,
     rmSync,
+    statSync,
     writeFileSync,
 } from 'node:fs';
 import os from 'node:os';
@@ -263,6 +264,8 @@ describe.runIf(process.platform === 'darwin')('macOS：真实的 account add（�
         await addAccount(d, 'mac1', { login: true });
         expect(d.store.get('mac1')?.paused).toBeUndefined();
         expect(existsSync(accountKeychainPath(path.join(config.accountsDir, 'mac1')))).toBe(true);
+        expect(statSync(path.join(config.accountsDir, 'mac1')).mode & 0o777).toBe(0o700);
+        expect(statSync(accountKeychainPath(path.join(config.accountsDir, 'mac1'))).mode & 0o777).toBe(0o600);
         expect(output.join('\n')).toContain('前后无变化');
         expect(output.join('\n')).not.toContain('回退文件');
         expect(snapshotChanges(before, await snapshotUserKeychains())).toEqual([]);

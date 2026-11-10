@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import type { RequestPermissionRequest, RequestPermissionResponse } from '@agentclientprotocol/sdk';
 import { realpathSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { AccountStore, type AccountRecord } from '../accounts/store.ts';
 import { unlockAccountKeychain } from '../accounts/credStore.ts';
@@ -9,12 +10,14 @@ import { listModels, type ModelInfo } from '../accounts/models.ts';
 import { Collector } from '../acp/collector.ts';
 import { AcpWorker } from '../acp/worker.ts';
 import { commandRulesFor, type FleetConfig } from '../config.ts';
+import { askBlocker } from '../policy/askText.ts';
 import { classifyFailure, FleetError, pauseScopeOf } from '../errors.ts';
 import { pidAlive } from '../fsutil.ts';
 import { createWorktree, diffStat, removeWorktree, type Worktree } from '../git/worktree.ts';
 import { log, openTaskLog, type TaskLog } from '../log.ts';
 import {
     judgePermission,
+    sensitiveUserRoots,
     toPermissionResponse,
     type ApprovedOperation,
     type DeniedOperation,
@@ -281,6 +284,7 @@ export class TaskManager {
             model,
             effort,
         });
+        for (const warning of this.#config.permissions.warnings) taskLog.write('permission_warning', { warning });
         taskLog.write('worktree_ready', { path: worktree.path, branch: worktree.branch, base: worktree.baseCommit });
 
         const now = new Date().toISOString();
@@ -549,6 +553,14 @@ export class TaskManager {
             return toPermissionResponse(request, true);
         }
         const operation = verdict.denied;
+        const blocker = verdict.askable && permissions.outsidePolicy === 'ask' ? askBlocker(operation) : undefined;
+        if (blocker !== undefined) {
+            // 原文过长：用户在弹窗里看不全，不能让他确认看不见的内容。
+            const denied = { ...operation, reason: `${operation.reason}；${blocker}，未询问用户` };
+            live.denied.push(denied);
+            taskLog.write('permission_denied', { ...denied });
+            return toPermissionResponse(request, false);
+        }
         if (verdict.askable && permissions.outsidePolicy === 'ask') {
             taskLog.write('permission_ask', { ...operation });
             let answer: AskAnswer = 'unsupported';
@@ -583,14 +595,24 @@ export class TaskManager {
     }
 
     /**
-     * worktree 外即使用户同意也不允许修改的位置：agy-fleet 的数据目录、配置文件、账号库、账号目录、本任务账号的 HOME。
-     * 改这些等于让工作进程给自己放宽权限或拿到凭据。
+     * worktree 外即使用户同意也不允许修改的位置：agy-fleet 的数据目录、配置文件、账号库、账号目录、本任务账号的 HOME，
+     * 以及用户 HOME 下的敏感文件（见 SENSITIVE_USER_PATHS）。改这些等于让工作进程给自己放宽权限、拿到凭据，
+     * 或埋下用户日后会执行的代码。内置，配置无法关闭。
      */
     #protectedRoots(accountName: string): string[] {
         const config = this.#config;
         const home = this.accounts.get(accountName)?.home;
-        const roots = [config.dataDir, config.accountsFile, config.accountsDir, config.configFile, home];
-        return roots.filter((p): p is string => p !== undefined).map(realOrResolved);
+        const roots = [config.dataDir, config.accountsFile, config.accountsDir, config.configFile, home].filter(
+            (p): p is string => p !== undefined,
+        );
+        // 字面路径与真实路径都放进去：被比较的一方是真实路径，受保护位置自己若经过符号链接也要覆盖。
+        return [
+            ...new Set([
+                ...roots.map((p) => path.resolve(p)),
+                ...roots.map(realOrResolved),
+                ...sensitiveUserRoots(os.homedir()),
+            ]),
+        ];
     }
 
     /** 一轮失败：分类、写日志、必要时暂停账号、回收子进程。worktree 与会话保留。 */

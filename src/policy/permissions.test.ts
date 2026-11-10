@@ -4,7 +4,7 @@ import path from 'node:path';
 import type { RequestPermissionRequest } from '@agentclientprotocol/sdk';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { parseCommandRule } from './commands.ts';
-import { judgePermission, toPermissionResponse } from './permissions.ts';
+import { extractPaths, judgePermission, sensitiveUserRoots, toPermissionResponse } from './permissions.ts';
 
 type ToolCall = RequestPermissionRequest['toolCall'];
 
@@ -150,6 +150,166 @@ describe('judgePermission：文件编辑', () => {
             false,
         );
         expect(judgePermission({ ...edit(path.join(worktree, 'x.txt')), kind: 'delete' }, worktree).allow).toBe(true);
+    });
+});
+
+describe('judgePermission：rawInput 里的其他路径键', () => {
+    const inside = (): string => path.join(worktree, 'ok.txt');
+    const call = (rawInput: Record<string, unknown>, locations: string[] = []): ToolCall => ({
+        toolCallId: 't',
+        kind: 'edit',
+        name: 'replace_file_content',
+        locations: locations.map((p) => ({ path: p })),
+        rawInput,
+    });
+
+    it('locations 在内、TargetFile 在外：拒绝（可询问）', () => {
+        expect(judgePermission(call({ TargetFile: path.join(outside, 'x.txt') }, [inside()]), worktree)).toMatchObject({
+            allow: false,
+            askable: true,
+            denied: { target: path.join(outside, 'x.txt') },
+        });
+    });
+
+    it('locations 为空、TargetFile 在外：拒绝', () => {
+        expect(judgePermission(call({ TargetFile: path.join(outside, 'x.txt') }), worktree).allow).toBe(false);
+    });
+
+    it.each([
+        'Destination',
+        'DestinationPath',
+        'AbsolutePath',
+        'FilePath',
+        'SourcePath',
+        'DirectoryPath',
+        'targetfile',
+    ])('%s 在外：拒绝', (key) => {
+        expect(judgePermission(call({ Path: inside(), [key]: path.join(outside, 'x') }), worktree).allow).toBe(false);
+    });
+
+    it('键名含 path/file/dir/target/destination/source 的未知键也检查', () => {
+        for (const key of ['NewFilePath', 'OutputDir', 'MoveTarget', 'SourceFiles', 'backupPathName']) {
+            expect(judgePermission(call({ Path: inside(), [key]: path.join(outside, 'x') }), worktree).allow, key).toBe(
+                false,
+            );
+        }
+    });
+
+    it('像路径的键下的字符串数组逐项检查', () => {
+        expect(judgePermission(call({ FilePaths: [inside(), path.join(outside, 'x')] }), worktree).allow).toBe(false);
+        expect(judgePermission(call({ FilePaths: [inside(), path.join(worktree, 'b.txt')] }), worktree).allow).toBe(
+            true,
+        );
+    });
+
+    it('全部在内时放行；Destination 指向 .git 时直接拒绝', () => {
+        expect(
+            judgePermission(
+                call({ SourcePath: inside(), Destination: path.join(worktree, 'moved.txt') }, [inside()]),
+                worktree,
+            ),
+        ).toEqual({ allow: true });
+        expect(
+            judgePermission(call({ SourcePath: inside(), Destination: path.join(worktree, '.git', 'x') }), worktree),
+        ).toMatchObject({ allow: false, askable: false });
+    });
+
+    it('只展开第一层：像路径的键下是对象、或数组里有对象时直接拒绝（不可询问）', () => {
+        expect(
+            judgePermission(call({ Path: inside(), Target: { file: path.join(outside, 'x') } }), worktree),
+        ).toMatchObject({
+            allow: false,
+            askable: false,
+        });
+        expect(judgePermission(call({ Files: [inside(), { p: 'x' }] }), worktree)).toMatchObject({
+            allow: false,
+            askable: false,
+        });
+    });
+
+    it('不像路径的键与文件内容不当作路径', () => {
+        const v = judgePermission(
+            call({
+                Path: inside(),
+                TargetContent: `import x from '../../../../../etc/passwd';`,
+                ReplacementContent: '/etc/passwd',
+                Instruction: '/etc/passwd',
+                IsDirectory: true,
+                Options: { anything: '/etc/passwd' },
+            }),
+            worktree,
+        );
+        expect(v).toEqual({ allow: true });
+    });
+
+    it('extractPaths 去重并合并 locations 与 rawInput', () => {
+        expect(extractPaths(call({ Path: inside(), TargetFile: inside() }, [inside()]))).toEqual({
+            paths: [inside()],
+            unverifiable: [],
+        });
+    });
+});
+
+describe('judgePermission：用户 HOME 下的敏感位置', () => {
+    let userHome: string;
+    let accountHome: string;
+
+    beforeAll(() => {
+        userHome = path.join(root, 'user');
+        accountHome = path.join(root, 'acct');
+        mkdirSync(path.join(userHome, '.ssh'), { recursive: true });
+        mkdirSync(path.join(userHome, 'Library', 'LaunchAgents'), { recursive: true });
+        mkdirSync(accountHome);
+        writeFileSync(path.join(userHome, '.gitconfig'), '[user]\n');
+        symlinkSync(path.join(userHome, '.gitconfig'), path.join(accountHome, '.gitconfig'));
+        symlinkSync(userHome, path.join(root, 'user-link'));
+    });
+
+    const rulesFor = (): { protectedRoots: string[] } => ({ protectedRoots: sensitiveUserRoots(userHome) });
+
+    it.each([
+        '.gitconfig',
+        '.config/git/config',
+        '.ssh/authorized_keys',
+        '.zshrc',
+        '.zprofile',
+        '.zshenv',
+        '.bashrc',
+        '.bash_profile',
+        '.profile',
+        '.npmrc',
+        '.aws/credentials',
+        '.gnupg/gpg.conf',
+        'Library/LaunchAgents/x.plist',
+        '.config/gh/hosts.yml',
+    ])('直接路径 ~/%s：直接拒绝，不可询问', (relative) => {
+        expect(judgePermission(edit(path.join(userHome, ...relative.split('/'))), worktree, rulesFor())).toMatchObject({
+            allow: false,
+            askable: false,
+        });
+    });
+
+    it('账号 HOME 里指向 ~/.gitconfig 的符号链接：直接拒绝', () => {
+        expect(judgePermission(edit(path.join(accountHome, '.gitconfig')), worktree, rulesFor())).toMatchObject({
+            allow: false,
+            askable: false,
+        });
+    });
+
+    it('经由指向用户 HOME 的符号链接、或大小写不同：直接拒绝', () => {
+        expect(judgePermission(edit(path.join(root, 'user-link', '.zshrc')), worktree, rulesFor())).toMatchObject({
+            askable: false,
+        });
+        expect(judgePermission(edit(path.join(userHome, '.GitConfig')), worktree, rulesFor())).toMatchObject({
+            askable: false,
+        });
+    });
+
+    it('用户 HOME 下的其他文件仍是“越界、可询问”', () => {
+        expect(judgePermission(edit(path.join(userHome, 'notes.txt')), worktree, rulesFor())).toMatchObject({
+            allow: false,
+            askable: true,
+        });
     });
 });
 

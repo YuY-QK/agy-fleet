@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parse as parseYaml } from 'yaml';
 import { z } from 'zod';
-import { parseCommandRule, type CommandRule } from './policy/commands.ts';
+import { isLauncherWildcard, parseCommandRule, type CommandRule } from './policy/commands.ts';
 
 // 配置来源与优先级：环境变量 > 配置文件（<数据目录>/config.yaml，或 AGY_FLEET_CONFIG 指定）> 默认值（PLAN §6.8）。
 // 配置文件只在进程启动时读一次；格式或字段写错就报错退出，不静默忽略。
@@ -20,6 +20,8 @@ export interface PermissionConfig {
     commands: CommandRule[];
     /** 按仓库追加的命令白名单，键为仓库根目录的真实路径。 */
     repoCommands: Map<string, CommandRule[]>;
+    /** 需要醒目提示的配置（如显式接受了启动器的 `*` 条目），启动时写 stderr，并写进每个任务日志。 */
+    warnings: string[];
 }
 
 export interface FleetConfig {
@@ -77,6 +79,7 @@ const FileSchema = z.strictObject({
         .strictObject({
             outside_policy: z.enum(['deny', 'ask']).optional(),
             ask_timeout_seconds: z.number().positive().max(3600).optional(),
+            allow_launcher_wildcards: z.boolean().optional(),
             commands: CommandList.optional(),
             repos: z.record(z.string().min(1), z.strictObject({ commands: CommandList.optional() })).optional(),
         })
@@ -115,13 +118,37 @@ function positive(raw: string | undefined, name: string): number | undefined {
     return value;
 }
 
-function parseRules(entries: string[] | undefined, where: string): CommandRule[] {
+const LAUNCHER_RISK =
+    '首个词是启动器/解释器，带 * 等于允许工作进程执行任意代码（如 git -c alias.x=!命令 x、find -exec、node -e）';
+
+/**
+ * 解析白名单条目。“启动器 + *”的条目默认拒绝（ConfigError）；`allowLauncherWildcards` 为真时接受，但记一条警告。
+ */
+function parseRules(
+    entries: string[] | undefined,
+    where: string,
+    allowLauncherWildcards: boolean,
+    warnings: string[],
+): CommandRule[] {
     return (entries ?? []).map((entry) => {
+        let rule: CommandRule;
         try {
-            return parseCommandRule(entry);
+            rule = parseCommandRule(entry);
         } catch (err) {
             throw new ConfigError(`${where}：${err instanceof Error ? err.message : String(err)}`);
         }
+        if (isLauncherWildcard(rule)) {
+            if (!allowLauncherWildcards) {
+                throw new ConfigError(
+                    `${where}：条目“${entry}”被拒绝：${LAUNCHER_RISK}。请改成精确条目（不带 *），` +
+                        '或在确认能接受这一后果后设置 permissions.allow_launcher_wildcards: true',
+                );
+            }
+            warnings.push(
+                `警告：命令白名单条目“${entry}”（${where}）${LAUNCHER_RISK}；已按 allow_launcher_wildcards 接受`,
+            );
+        }
+        return rule;
     });
 }
 
@@ -157,6 +184,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FleetConfig {
         throw new ConfigError(`AGY_FLEET_CONFIG 指定的配置文件不存在：${configFile}`);
 
     const perms = file.permissions ?? {};
+    const allowLauncherWildcards = perms.allow_launcher_wildcards === true;
+    const warnings: string[] = [];
     const repoCommands = new Map<string, CommandRule[]>();
     for (const [repo, entry] of Object.entries(perms.repos ?? {})) {
         const expanded = expandHome(repo);
@@ -164,7 +193,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FleetConfig {
             throw new ConfigError(`permissions.repos 的键必须是仓库绝对路径：${repo}`);
         }
         const key = realOrResolved(expanded);
-        const rules = parseRules(entry.commands, `permissions.repos.${repo}.commands`);
+        const rules = parseRules(
+            entry.commands,
+            `permissions.repos.${repo}.commands`,
+            allowLauncherWildcards,
+            warnings,
+        );
         repoCommands.set(key, [...(repoCommands.get(key) ?? []), ...rules]);
     }
 
@@ -201,8 +235,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): FleetConfig {
         permissions: {
             outsidePolicy: perms.outside_policy ?? 'deny',
             askTimeoutMs: (perms.ask_timeout_seconds ?? 300) * 1000,
-            commands: parseRules(perms.commands, 'permissions.commands'),
+            commands: parseRules(perms.commands, 'permissions.commands', allowLauncherWildcards, warnings),
             repoCommands,
+            warnings,
         },
     };
 }

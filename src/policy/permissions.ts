@@ -71,16 +71,64 @@ export function resolveRealPath(input: string, base: string): string {
     return current;
 }
 
-/** 从工具调用里取出涉及的路径：locations[].path 与 rawInput.Path，去重。 */
-export function extractPaths(toolCall: ToolCall): string[] {
+/** agy 工具参数里已知的路径键（小写比较）。 */
+const KNOWN_PATH_KEYS = new Set([
+    'path',
+    'targetfile',
+    'absolutepath',
+    'filepath',
+    'sourcepath',
+    'destination',
+    'destinationpath',
+    'directorypath',
+]);
+/** 键名含这些词的字符串参数也当作路径（宁多勿少）。 */
+const PATH_LIKE_KEY = /path|file|dir|target|destination|source/i;
+/**
+ * 例外：键名含 content 的是文件内容（如 TargetContent、ReplacementContent），不是路径；
+ * 把代码文本当路径解析，遇到 `../` 之类会把正常编辑误判为越界。已知路径键不受此例外影响。
+ */
+const CONTENT_KEY = /content/i;
+
+function isPathKey(key: string): boolean {
+    const lower = key.toLowerCase();
+    return KNOWN_PATH_KEYS.has(lower) || (PATH_LIKE_KEY.test(key) && !CONTENT_KEY.test(key));
+}
+
+/** 从请求里取出的路径。`unverifiable` 是像路径的键但值无法检查（嵌套对象等），必须直接拒绝。 */
+export interface ExtractedPaths {
+    paths: string[];
+    unverifiable: string[];
+}
+
+/**
+ * 从工具调用里取出涉及的路径：`locations[].path`，加上 `rawInput` 第一层所有像路径的键的字符串值
+ * （以及这些键下字符串数组的元素），去重。只看第一层：像路径的键下若是对象、或数组里有非字符串元素，
+ * 记入 `unverifiable`，由调用方直接拒绝；不像路径的键下的嵌套对象不展开。
+ */
+export function extractPaths(toolCall: ToolCall): ExtractedPaths {
     const found = new Set<string>();
+    const unverifiable: string[] = [];
     for (const location of toolCall.locations ?? []) found.add(location.path);
     const raw = toolCall.rawInput;
-    if (typeof raw === 'object' && raw !== null) {
-        const p = (raw as Record<string, unknown>).Path;
-        if (typeof p === 'string' && p !== '') found.add(p);
+    if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+        for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+            if (!isPathKey(key)) continue;
+            if (typeof value === 'string') {
+                if (value !== '') found.add(value);
+            } else if (Array.isArray(value)) {
+                for (const item of value) {
+                    if (typeof item === 'string') {
+                        if (item !== '') found.add(item);
+                    } else unverifiable.push(key);
+                }
+            } else if (typeof value === 'object' && value !== null) {
+                unverifiable.push(key);
+            }
+            // 数字、布尔、null（如 IsDirectory: true）不是路径，忽略。
+        }
     }
-    return [...found];
+    return { paths: [...found], unverifiable: [...new Set(unverifiable)] };
 }
 
 function commandOf(toolCall: ToolCall): string | undefined {
@@ -92,12 +140,55 @@ function commandOf(toolCall: ToolCall): string | undefined {
     return undefined;
 }
 
+/**
+ * 用户 HOME 下改了就会在用户日常使用时执行代码或泄露凭据的位置（持久化代码执行路径）。
+ * 内置、配置无法关闭；无论 outside_policy 都直接拒绝。
+ */
+export const SENSITIVE_USER_PATHS: readonly string[] = [
+    '.gitconfig',
+    '.config/git',
+    '.ssh',
+    '.zshrc',
+    '.zprofile',
+    '.zshenv',
+    '.zlogin',
+    '.bashrc',
+    '.bash_profile',
+    '.bash_login',
+    '.profile',
+    '.npmrc',
+    '.aws',
+    '.gnupg',
+    'Library/LaunchAgents',
+    '.config/gh',
+];
+
+/** 用户 HOME 下受保护位置的字面路径与真实路径（HOME 本身是符号链接时两者不同），去重。 */
+export function sensitiveUserRoots(userHome: string): string[] {
+    const homes = new Set([path.resolve(userHome)]);
+    try {
+        homes.add(realpathSync(userHome));
+    } catch {
+        // HOME 不存在时只用字面路径
+    }
+    const roots = new Set<string>();
+    for (const home of homes) {
+        for (const relative of SENSITIVE_USER_PATHS) roots.add(path.join(home, ...relative.split('/')));
+    }
+    return [...roots];
+}
+
 /** 适用于一个任务的规则（全部来自配置文件与代码，调用方无法放宽）。 */
 export interface PermissionRules {
     /** 命令白名单（全局 + 按仓库）。 */
     commands?: readonly CommandRule[];
-    /** worktree 外、即使用户同意也不允许修改的目录或文件（真实路径）。 */
+    /** worktree 外、即使用户同意也不允许修改的目录或文件（同时给出字面路径与真实路径）。 */
     protectedRoots?: readonly string[];
+}
+
+/** 受保护位置按小写比较：macOS 默认文件系统不区分大小写，`~/.GitConfig` 就是 `~/.gitconfig`。宁可多拒。 */
+function isWithinIgnoringCase(child: string, parent: string): boolean {
+    return isWithin(child.toLowerCase(), parent.toLowerCase());
 }
 
 function isWithin(child: string, parent: string): boolean {
@@ -131,10 +222,10 @@ function checkInside(
     const relative = path.relative(worktree, real);
     if (relative === '') return { reason: `${candidate} 指向 worktree 根目录本身`, askable: false };
     if (isWithin(real, worktree)) return undefined;
-    const guarded = protectedRoots.find((root) => isWithin(real, root));
+    const guarded = protectedRoots.find((root) => isWithinIgnoringCase(real, root));
     if (guarded !== undefined) {
         return {
-            reason: `${candidate} 解析后为 ${real}，属于受保护的 agy-fleet 数据/配置或账号目录 ${guarded}`,
+            reason: `${candidate} 解析后为 ${real}，属于受保护的位置 ${guarded}`,
             askable: false,
         };
     }
@@ -167,7 +258,14 @@ export function judgePermission(toolCall: ToolCall, worktree: string, rules: Per
     });
 
     if (FILE_MUTATION_KINDS.has(kind)) {
-        const paths = extractPaths(toolCall);
+        const { paths, unverifiable } = extractPaths(toolCall);
+        if (unverifiable.length > 0) {
+            return deny(
+                `${toolCall.title ?? tool}（${unverifiable.join(', ')}）`,
+                `请求参数 ${unverifiable.join(', ')} 的值不是路径字符串，无法确认在 worktree 内`,
+                false,
+            );
+        }
         if (paths.length === 0) return deny(toolCall.title ?? tool, '请求里没有路径，无法确认在 worktree 内', false);
         // 先找必须直接拒绝的路径：一次请求里只要有一个这样的路径，就不能交给用户询问。
         let outside: { candidate: string; reason: string } | undefined;

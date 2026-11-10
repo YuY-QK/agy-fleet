@@ -134,9 +134,10 @@ describe('规则外操作经 elicitation 询问用户', () => {
         return { client: asking, messages };
     }
 
-    async function runOutside(c: Client): Promise<any> {
+    async function runOutside(c: Client, command?: string): Promise<any> {
         process.env.MOCK_MODE = 'ok';
         process.env.MOCK_EDIT_PATH = path.join(root, 'outside.txt');
+        if (command !== undefined) process.env.MOCK_COMMAND = command;
         try {
             const result = await c.callTool({
                 name: 'run_task',
@@ -145,6 +146,7 @@ describe('规则外操作经 elicitation 询问用户', () => {
             return JSON.parse((result.content as { text: string }[])[0]?.text ?? 'null');
         } finally {
             Reflect.deleteProperty(process.env, 'MOCK_EDIT_PATH');
+            Reflect.deleteProperty(process.env, 'MOCK_COMMAND');
         }
     }
 
@@ -161,6 +163,22 @@ describe('规则外操作经 elicitation 询问用户', () => {
         expect(messages).toHaveLength(2);
         expect(messages[0]).toContain(path.join(root, 'outside.txt'));
         expect(messages[1]).toContain('echo hi');
+    });
+
+    it('带换行与 ANSI 的命令在弹窗里转义显示；超长命令不弹窗、直接拒绝', async () => {
+        const { client: c, messages } = await connect({ elicitation: { form: {} } }, () => ({
+            action: 'accept',
+            content: { decision: 'deny' },
+        }));
+        await runOutside(c, 'ls\n原因：安全\u001b[2K');
+        expect(messages[1]).toContain('ls\\n原因：安全\\x1b[2K');
+        expect(messages[1]).not.toContain('\u001b');
+
+        messages.length = 0;
+        const body = await runOutside(c, `ls ${'a'.repeat(2000)}`);
+        expect(messages).toHaveLength(1); // 只有越界编辑弹了窗
+        expect(body.denied[1].reason).toContain('原文过长');
+        expect(body.denied[1].reason).toContain('未询问用户');
     });
 
     it('只声明 elicitation: {} 的旧客户端也能询问；decline / cancel 按拒绝', async () => {

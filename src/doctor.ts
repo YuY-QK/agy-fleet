@@ -62,6 +62,10 @@ export async function runDoctor(
             `全局命令白名单 ${String(config.permissions.commands.length)} 条，按仓库 ${String(config.permissions.repoCommands.size)} 个仓库`,
     });
 
+    for (const warning of config.permissions.warnings) {
+        checks.push({ level: 'warn', subject: '权限', detail: warning, hint: '改成精确条目，或确认能接受后果' });
+    }
+
     const agy = await version(config.agyBin, ['--version']);
     if (!agy.ok) {
         checks.push({

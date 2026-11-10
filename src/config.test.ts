@@ -40,7 +40,7 @@ describe('loadConfig', () => {
                 'permissions:',
                 '  outside_policy: ask',
                 '  ask_timeout_seconds: 60',
-                '  commands: ["git status", "git diff *"]',
+                '  commands: ["git status", "git diff --stat"]',
             ].join('\n'),
         );
         const config = loadConfig({ AGY_FLEET_DATA_DIR: dir, AGY_FLEET_GLOBAL_CONCURRENCY: '3' });
@@ -52,7 +52,7 @@ describe('loadConfig', () => {
         expect(config.defaultModel).toBe('m1');
         expect(config.permissions.outsidePolicy).toBe('ask');
         expect(config.permissions.askTimeoutMs).toBe(60_000);
-        expect(config.permissions.commands.map((r) => r.source)).toEqual(['git status', 'git diff *']);
+        expect(config.permissions.commands.map((r) => r.source)).toEqual(['git status', 'git diff --stat']);
     });
 
     it('按仓库的白名单以仓库真实路径为键，与全局合并', () => {
@@ -96,6 +96,46 @@ describe('loadConfig', () => {
         expect(() => loadConfig({ AGY_FLEET_DATA_DIR: dir, AGY_FLEET_TURN_TIMEOUT_MINUTES: 'abc' })).toThrow(
             'AGY_FLEET_TURN_TIMEOUT_MINUTES',
         );
+    });
+
+    it.each([
+        'git *',
+        'find *',
+        'node *',
+        'npm *',
+        'pnpm *',
+        'env *',
+        'xargs *',
+        'python3 *',
+        'sh *',
+        'bash *',
+        'ssh *',
+        '/usr/bin/git *',
+    ])('启动器/解释器的 * 条目默认加载失败：%s', (entry) => {
+        writeConfig(`permissions:\n  commands: ["${entry}"]\n`);
+        expect(() => loadConfig({ AGY_FLEET_DATA_DIR: dir })).toThrow('allow_launcher_wildcards');
+    });
+
+    it('按仓库的白名单同样默认拒绝启动器 * 条目', () => {
+        writeConfig(`permissions:\n  repos:\n    ${dir}:\n      commands: ["git *"]\n`);
+        expect(() => loadConfig({ AGY_FLEET_DATA_DIR: dir })).toThrow('任意代码');
+    });
+
+    it('allow_launcher_wildcards: true 时接受并给出警告', () => {
+        writeConfig('permissions:\n  allow_launcher_wildcards: true\n  commands: ["git *", "git status"]\n');
+        const config = loadConfig({ AGY_FLEET_DATA_DIR: dir });
+        expect(config.permissions.commands.map((r) => r.source)).toEqual(['git *', 'git status']);
+        expect(config.permissions.warnings).toHaveLength(1);
+        expect(config.permissions.warnings[0]).toContain('git *');
+    });
+
+    it('精确条目与非启动器的 * 条目不受影响，也没有警告', () => {
+        writeConfig('permissions:\n  commands: ["git status", "pnpm test", "git diff *", "ls *"]\n');
+        expect(() => loadConfig({ AGY_FLEET_DATA_DIR: dir })).toThrow('git diff *');
+        writeConfig('permissions:\n  commands: ["git status", "pnpm test", "ls *", "cat *"]\n');
+        const config = loadConfig({ AGY_FLEET_DATA_DIR: dir });
+        expect(config.permissions.commands).toHaveLength(4);
+        expect(config.permissions.warnings).toEqual([]);
     });
 
     it('空配置文件等同没有配置', () => {

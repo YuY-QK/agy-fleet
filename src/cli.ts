@@ -161,6 +161,7 @@ async function runDoctorCommand(argv: string[]): Promise<void> {
 
 async function runMcp(): Promise<void> {
     const config = loadConfig();
+    for (const warning of config.permissions.warnings) log.warn(warning);
     const manager = new TaskManager(config);
     manager.init();
     const server = createServer(manager, { askTimeoutMs: config.permissions.askTimeoutMs });

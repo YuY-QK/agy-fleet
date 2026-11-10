@@ -3,6 +3,7 @@ import { ElicitResultSchema, ErrorCode, McpError, type CallToolResult } from '@m
 import { z } from 'zod';
 import { FleetError } from '../errors.ts';
 import { log } from '../log.ts';
+import { formatAskMessage } from '../policy/askText.ts';
 import type { AskAnswer, PermissionAsker, TaskManager } from '../tasks/manager.ts';
 
 const STATUS = z.enum(['running', 'idle', 'failed', 'closed']);
@@ -28,20 +29,6 @@ function fail(tool: string, err: unknown): CallToolResult {
 /** MCP 请求超时的错误码（SDK 把它定义成枚举，McpError.code 是普通数字）。 */
 const REQUEST_TIMEOUT: number = ErrorCode.RequestTimeout;
 
-const KIND_TEXT: Record<string, string> = {
-    edit: '修改文件',
-    delete: '删除文件',
-    move: '移动文件',
-    execute: '执行命令',
-};
-
-/** 弹窗里的文本来自工作进程，过长时截断，避免把提示语挤出视野。 */
-function clip(text: string, max = 1500): string {
-    return text.length <= max
-        ? text
-        : `${text.slice(0, max)}…（已截断，共 ${String(text.length)} 字符，完整内容见任务日志）`;
-}
-
 /**
  * 用 MCP elicitation 询问用户是否允许一次规则外的操作。
  * 客户端没有声明 elicitation 能力时不发请求，直接返回 unsupported（按拒绝处理）。
@@ -51,10 +38,13 @@ function clip(text: string, max = 1500): string {
 function elicitationAsker(server: McpServer, timeoutMs: number): PermissionAsker {
     return async ({ taskId, account, operation }, signal): Promise<AskAnswer> => {
         if (server.server.getClientCapabilities()?.elicitation === undefined) return 'unsupported';
-        const what = KIND_TEXT[operation.kind] ?? `“${operation.kind}”类操作`;
-        const message =
-            `agy-fleet：任务 ${taskId}（账号 ${account}）请求${what}，超出权限规则：\n\n` +
-            `${clip(operation.target)}\n\n原因：${clip(operation.reason)}\n\n只允许这一次吗？不回应或取消都按拒绝处理。`;
+        const text = formatAskMessage({ taskId, account, operation });
+        if (!text.ok) {
+            // 正常情况下 TaskManager 已先行拦下；这里是兜底，绝不弹出看不全的内容。
+            log.warn('原文无法完整展示，不询问用户，按拒绝处理', { task: taskId, reason: text.reason });
+            return 'error';
+        }
+        const message = text.message;
         try {
             const result = await server.server.request(
                 {

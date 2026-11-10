@@ -444,6 +444,7 @@ describe('权限规则与询问用户（outside_policy）', () => {
         askTimeoutMs: 1000,
         commands: commands.map(parseCommandRule),
         repoCommands: new Map(repoCommands.map(([k, v]) => [k, v.map(parseCommandRule)])),
+        warnings: [],
     });
     const outsidePath = (): string => path.join(root, 'outside.txt');
 
@@ -538,6 +539,9 @@ describe('权限规则与询问用户（outside_policy）', () => {
             path.join(root, 'data', 'config.yaml'),
             path.join(root, 'data', 'accounts.json'),
             path.join(root, 'homes', 'a1', '.gemini', 'settings.json'),
+            // 用户 HOME 下的敏感文件（模拟 agent 只发权限请求，不会真的写）。
+            path.join(os.homedir(), '.gitconfig'),
+            path.join(os.homedir(), '.zshrc'),
         ]) {
             mock('ok', { MOCK_EDIT_PATH: target });
             const task = await manager.runTask({ prompt: 'x', repo });

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -52,6 +52,9 @@ describe.runIf(isMac)('macOS 账号钥匙串（临时 HOME）', () => {
         const result = await prepareCredentialStore(home);
         expect(result).toMatchObject({ prepared: true, created: true, keychain: accountKeychainPath(home) });
         expect(existsSync(accountKeychainPath(home))).toBe(true);
+        // 钥匙串密码为空，只靠文件权限保护：文件 0600、目录 0700。
+        expect(statSync(accountKeychainPath(home)).mode & 0o777).toBe(0o600);
+        expect(statSync(path.dirname(accountKeychainPath(home))).mode & 0o777).toBe(0o700);
         expect(existsSync(path.join(home, 'Library', 'Preferences', 'com.apple.security.plist'))).toBe(true);
         expect(securityAs(home, ['default-keychain', '-d', 'user'])).toContain('agy.keychain-db');
         expect(snapshotChanges(before, await snapshotUserKeychains())).toEqual([]);

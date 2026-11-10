@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
@@ -158,6 +158,10 @@ export async function prepareCredentialStore(
     }
 
     await assertUnchanged(before, snapshot, userHome);
+
+    // 钥匙串密码为空，令牌只受文件与目录权限保护（不是加密保护）：只留给当前用户读写。
+    chmodSync(keychain, 0o600);
+    chmodSync(path.dirname(keychain), 0o700);
 
     if (!existsSync(accountPrefsPath(home))) {
         throw new Error(`钥匙串设置没有写入 ${accountPrefsPath(home)}，agy 登录时仍会弹窗`);
