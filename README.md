@@ -44,9 +44,11 @@ turn_timeout_minutes: 30
 permissions:
     outside_policy: deny # deny（默认）| ask：在客户端弹窗请你确认，客户端不支持时按拒绝
     ask_timeout_seconds: 300
-    commands: # 全局命令白名单，默认为空
+    # allow_launcher_wildcards: false # 默认 false：拒绝“启动器/解释器 + *”的条目（见下方风险说明）
+    commands: # 全局命令白名单，默认为空；优先写精确条目
         - git status
-        - git diff * # 末尾 * 表示允许追加任意参数
+        - git diff --stat
+        - ls * # 末尾 * 表示允许追加任意参数；git *、node *、npm * 这类条目等于允许任意代码执行
     repos:
         /path/to/repo: # 仓库根目录的绝对路径
             commands:
@@ -55,10 +57,23 @@ permissions:
 
 权限规则：
 
-- 文件编辑只允许在本任务 worktree 内；任何 `.git` 路径、agy-fleet 自己的数据与配置、账号 HOME 一律拒绝（不询问）。
+- 文件编辑只允许在本任务 worktree 内。请求里的所有路径（`locations` 以及参数里 `Path`、`TargetFile`、`Destination` 等像路径的键）都要在内。
+- 以下位置一律拒绝、不询问（内置，配置无法关闭）：任何 `.git` 路径；agy-fleet 自己的数据目录、配置、账号库、账号 HOME；你 HOME 下的 `.gitconfig`、`.config/git`、`.ssh`、`.zshrc`、`.zprofile`、`.zshenv`、`.bashrc`、`.bash_profile`、`.profile`、`.npmrc`、`.aws`、`.gnupg`、`Library/LaunchAgents`、`.config/gh`（包括账号 HOME 里指向它们的链接）。
 - 命令必须与白名单条目逐词相同（或匹配末尾 `*` 的前缀）。含 `;`、`&&`、`|`、`$()`、反引号、重定向、通配符、换行、`VAR=值` 前缀等的命令一律不算命中，按 `outside_policy` 处理。
-- **风险提示**：白名单里任何会执行仓库代码的命令（测试、构建、`npm run`、`make` 等）都等于允许工作进程执行任意代码——它可以先改测试或脚本再运行。末尾 `*` 的条目允许任意参数（包括可能写文件的选项）。只把你能接受这种后果的命令放进去，优先写精确条目。
+- 询问弹窗里的命令与路径把换行和控制字符转义显示，并标出原文长度；原文太长看不全时不弹窗，直接拒绝。
 - 规则只来自配置文件，MCP 工具参数无法放宽。被拒绝的操作进任务结果的 `denied`，经你在弹窗里批准的进 `approved`，都写入任务日志。
+
+## 风险
+
+使用前请知悉：
+
+- **工作进程能读你能读的任何文件。** agy 读文件时不发权限请求（M0 实测），所以权限规则管不住“读”：工作进程可以读 `~/.ssh`、其他项目、任何你有权读的文件，并把内容写进汇报或发给模型服务。只在你能接受这一点的机器和账号上使用。
+- **账号钥匙串不是加密保护。** 每个账号的独立钥匙串密码为空（为了不弹窗），令牌只受文件与目录权限保护：账号 HOME 为 `0700`，钥匙串文件为 `0600`。能以你的身份读文件的程序都能读到这些令牌。
+- **白名单命令可能等于任意代码执行。**
+    - 会执行仓库代码的命令（测试、构建、`npm run`、`make` 等）：工作进程可以先改测试或脚本再运行。
+    - 带 `*` 的启动器/解释器条目——`git *`、`find *`、`node *`、`npm *`、`pnpm *`、`env *`、`xargs *`、`python *`、`sh *`、`bash *`、`ssh *` 等——参数本身就能指定要执行的代码（如 `git -c 'alias.x=!命令' x`、`git --upload-pack=命令 fetch`、`find -exec`、`node -e`）。这类条目默认加载失败；设置 `permissions.allow_launcher_wildcards: true` 才接受，并会在启动时与每个任务日志里给出警告。
+    - 其他带 `*` 的条目允许任意参数（包括可能写文件的选项）。优先写精确条目。
+- **多账号使用可能违反服务条款。** 本工具不做任何规避额度或风控的处理，与 Google 无关。
 
 ### 环境变量（均可选，优先于配置文件）
 
