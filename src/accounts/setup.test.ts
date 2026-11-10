@@ -153,7 +153,8 @@ describe('account add / login', () => {
         expect(existsSync(path.join(config.accountsDir, 'w2', 'keep.txt'))).toBe(true);
     });
 
-    it('凭据存储准备失败：中止、不登记、保留目录', async () => {
+    // 非 macOS 不做凭据存储处理（prepareStore 直接跳过，注入的 prepare 不会被调用），所以这条只在 macOS 上有意义。
+    it.runIf(process.platform === 'darwin')('凭据存储准备失败：中止、不登记、保留目录', async () => {
         const d = deps({ prepare: () => Promise.reject(new Error('钥匙串坏了')) });
         expect(await failure(addAccount(d, 'w1', { login: true }))).toContain('钥匙串坏了');
         expect(d.store.get('w1')).toBeUndefined();
